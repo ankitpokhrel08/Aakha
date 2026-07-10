@@ -30,8 +30,9 @@ fastapi==0.121.2             # WS endpoints (/camera, /status, /control) + pages
 uvicorn[standard]==0.40.0    # ASGI server; [standard] pulls websockets + uvloop
 
 # --- Tier 2: scene captioning (Moondream2 via HF) ---
-transformers==5.13.0
-einops==0.8.2                # required by the Moondream2 model code
+transformers==4.52.4           # moondream2 2025-06-21 revision requires 4.52.4 exactly
+einops==0.8.2                  # required by the Moondream2 model code
+moondream==1.3.0               # standalone moondream package (Photon engine, for future GPU upgrade)
 
 # --- Tier 3: OCR + voice trigger ("what am I holding") ---
 pytesseract==0.3.13          # wrapper over the system `tesseract` binary

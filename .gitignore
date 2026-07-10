@@ -8,10 +8,14 @@ __pycache__/
 .venv/
 venv/
 env/
+<<<<<<< HEAD
 myenv/
 
 # Local runtime settings — each machine flips its own toggles, don't commit
 config.json
+=======
+env_aakha/
+>>>>>>> aman
 
 # Models / weights (downloaded per-machine, not committed)
 *.onnx
@@ -30,5 +34,10 @@ Context.txt
 PROGRESS.md
 .venv/
 
+<<<<<<< HEAD
 assets/annotated.mp4
 assets/cars.mp4
+=======
+# Vosk model zip and extracted folder
+vosk-model-*
+>>>>>>> aman
