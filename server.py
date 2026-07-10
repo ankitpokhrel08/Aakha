@@ -37,6 +37,7 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+from config import config
 from shared.bus import event_bus
 from shared.events import Event, Priority
 
@@ -224,6 +225,10 @@ async def _on_startup() -> None:
     _loop = asyncio.get_running_loop()
     _install_bus_tap()
 
+    # Live config: reload config.json when it changes on disk, and let the
+    # /control "set" action flip toggles mid-run. Watcher is a daemon thread.
+    config.start_watching()
+
     if START_WORKERS:
         try:
             import main
@@ -291,6 +296,36 @@ async def control_ws(ws: WebSocket) -> None:
                     )
                 )
                 await ws.send_json({"ok": True, "active": on})
+            elif action == "get":
+                # Return current settings so a dashboard can render controls.
+                await ws.send_json({"ok": True, "config": config.to_dict()})
+            elif action == "set":
+                # Flip a config value at runtime, e.g. cut traffic-light:
+                #   {"action":"set","key":"traffic_light_detection","value":false}
+                key = (msg or {}).get("key")
+                value = (msg or {}).get("value")
+                allowed = set(config.to_dict().keys())
+                if key not in allowed:
+                    await ws.send_json({
+                        "ok": False,
+                        "error": f"unknown config key: {key!r}",
+                        "keys": sorted(allowed),
+                    })
+                else:
+                    changed = config.update(**{key: value})  # persists to config.json
+                    current = config.to_dict()
+                    # Mirror onto the bus so the change shows on the dashboard
+                    # (and is spoken as a low-priority confirmation).
+                    event_bus.publish(
+                        Event(
+                            message=f"{key} set to {current[key]}",
+                            priority=Priority.LOW,
+                            type="config",
+                            source="control",
+                            data={"key": key, "value": current[key]},
+                        )
+                    )
+                    await ws.send_json({"ok": True, "changed": changed, "config": current})
             else:
                 await ws.send_json({"ok": False, "error": f"unknown action: {action}"})
     except WebSocketDisconnect:
