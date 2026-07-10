@@ -16,6 +16,7 @@ pillow==12.3.0
 opencv-python==5.0.0.93
 ultralytics==8.4.91          # YOLO11n + ByteTrack (model.track(persist=True))
 onnx==1.22.0                 # export YOLO11n -> ONNX
+onnxslim==0.1.94             # graph-slim step Ultralytics runs during ONNX export
 onnxruntime==1.27.0          # ONNX inference runtime
 torch==2.13.0                # pulled by ultralytics; also used directly by Tier 2
 torchvision==0.28.0
