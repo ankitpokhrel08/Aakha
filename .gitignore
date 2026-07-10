@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Models / weights (downloaded per-machine, not committed)
+*.onnx
+*.pt
+*.tflite
+models/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Platform tools and guide
+CLAUDE.md
+Context.txt
+PROGRESS.md
+.venv/

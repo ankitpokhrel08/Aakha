@@ -1,0 +1,33 @@
+# Aakha — assistive navigation stack.
+# Pinned against a Python 3.12 venv on macOS arm64 (Apple Silicon).
+#
+#   python3.12 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# NOTE: pytesseract is only a wrapper — it needs the Tesseract binary on the
+# system:  brew install tesseract   (already present on the dev machine).
+
+# --- core ---
+numpy==2.5.1
+pillow==12.3.0
+
+# --- Tier 1: vision (detection + tracking) ---
+opencv-python==5.0.0.93
+ultralytics==8.4.91          # YOLO11n + ByteTrack (model.track(persist=True))
+onnx==1.22.0                 # export YOLO11n -> ONNX
+onnxruntime==1.27.0          # ONNX inference runtime
+torch==2.13.0                # pulled by ultralytics; also used directly by Tier 2
+torchvision==0.28.0
+
+# --- audio out: TTS ---
+pyttsx3==2.99                # offline TTS (NSSpeechSynthesizer on macOS)
+
+# --- Tier 2: scene captioning (Moondream2 via HF) ---
+transformers==5.13.0
+einops==0.8.2                # required by the Moondream2 model code
+
+# --- Tier 3: OCR + voice trigger ("what am I holding") ---
+pytesseract==0.3.13          # wrapper over the system `tesseract` binary
+vosk==0.3.44                 # offline wake/command speech recognition
+mediapipe==0.10.35           # hand landmarks to locate the held object
