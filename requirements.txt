@@ -23,6 +23,10 @@ torchvision==0.28.0
 # --- audio out: TTS ---
 pyttsx3==2.99                # offline TTS (NSSpeechSynthesizer on macOS)
 
+# --- web layer: phone camera client + dashboard (Dev 3 / mobile-client) ---
+fastapi==0.121.2             # WS endpoints (/camera, /status, /control) + pages
+uvicorn[standard]==0.40.0    # ASGI server; [standard] pulls websockets + uvloop
+
 # --- Tier 2: scene captioning (Moondream2 via HF) ---
 transformers==5.13.0
 einops==0.8.2                # required by the Moondream2 model code
