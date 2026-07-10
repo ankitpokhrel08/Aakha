@@ -33,6 +33,10 @@ _LOOP_SLEEP_S = 0.2            # how long the thread sleeps between frame checks
 _THUMB_SIZE = (128, 128)       # size used for the cheap diff computation
 # ---------------------------------------------------------------------------
 
+# Sentinel set by voice_trigger when the user says "describe the scene".
+# The caption thread checks and clears it to bypass the cooldown/diff gate.
+_last_caption_requested: bool = False
+
 
 def _scene_changed(
     current: np.ndarray,
@@ -58,7 +62,7 @@ def _load_moondream():
         "vikhyatk/moondream2",
         revision="2025-06-21",
         trust_remote_code=True,
-    ).cuda()
+    )
     model.eval()
     print(f"[scene_caption] Moondream2 loaded in {time.time() - t0:.1f}s")
     return model
@@ -79,7 +83,18 @@ def _run_inference(model, bgr_frame: np.ndarray) -> str:
 
 def _caption_thread(get_frame: Callable[[], Optional[np.ndarray]]) -> None:
     """Background loop: detect scene changes, caption, publish to bus."""
-    model = _load_moondream()
+    global _last_caption_requested
+    try:
+        model = _load_moondream()
+    except Exception as exc:
+        print(
+            f"[scene_caption] Model failed to load: {exc}\n"
+            f"  If you see 'all_tied_weights_keys', run:\n"
+            f"    env_aakha/bin/pip install 'transformers==4.52.4'\n"
+            f"  Thread will idle until restarted with a compatible transformers."
+        )
+        while True:
+            time.sleep(60.0)
 
     last_captioned_frame: Optional[np.ndarray] = None
     last_caption_time: float = 0.0
@@ -91,16 +106,22 @@ def _caption_thread(get_frame: Callable[[], Optional[np.ndarray]]) -> None:
         if frame is None:
             continue
 
+        # On-demand request from voice_trigger ("describe the scene") bypasses
+        # both the cooldown and the scene-diff gate.
+        on_demand = _last_caption_requested
+        if on_demand:
+            _last_caption_requested = False
+
         now = time.time()
         cooldown_elapsed = (now - last_caption_time) >= _CAPTION_COOLDOWN_S
 
-        if not cooldown_elapsed:
-            continue
+        if not on_demand:
+            if not cooldown_elapsed:
+                continue
+            if not _scene_changed(frame, last_captioned_frame):
+                continue
 
-        if not _scene_changed(frame, last_captioned_frame):
-            continue
-
-        # Scene changed and cooldown elapsed — run captioning.
+        # Run captioning.
         t0 = time.time()
         caption = _run_inference(model, frame)
         elapsed = time.time() - t0
@@ -164,7 +185,7 @@ if __name__ == "__main__":
 
     # Pass a lambda that always returns the same frame (simulates a static scene).
     # Override the cooldown so the first caption fires immediately.
-    import vision.scene_caption as sc
+    import visuals.scene_caption as sc
     sc._CAPTION_COOLDOWN_S = 0.0
 
     print("[test] Starting scene caption thread...")

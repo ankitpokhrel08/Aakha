@@ -4,6 +4,11 @@ Architecture contract:
 - There is EXACTLY ONE consumer thread. Never start a second one.
 - CRITICAL events are always dequeued before NORMAL/LOW (priority queue guarantee).
 - All other modules publish to event_bus; they never call pyttsx3 directly.
+
+"Repeat that" support:
+- The consumer keeps the last spoken message in `last_spoken` (module-level).
+- voice_trigger dispatches a "repeat" command by publishing an Event with
+  type="repeat"; the consumer detects it and re-speaks `last_spoken`.
 """
 from __future__ import annotations
 
@@ -22,6 +27,24 @@ import pyttsx3
 
 from shared.bus import event_bus
 from shared.events import Event, Priority
+
+# ---------------------------------------------------------------------------
+# Shared "repeat that" buffer — written by consumer, read by anyone who needs
+# to know what was last spoken (currently only voice_trigger dispatch).
+# ---------------------------------------------------------------------------
+_last_spoken_lock = threading.Lock()
+last_spoken: str = ""
+
+
+def get_last_spoken() -> str:
+    with _last_spoken_lock:
+        return last_spoken
+
+
+def _set_last_spoken(msg: str) -> None:
+    global last_spoken
+    with _last_spoken_lock:
+        last_spoken = msg
 
 
 def _consumer_loop() -> None:
@@ -46,8 +69,16 @@ def _consumer_loop() -> None:
             continue
 
         try:
-            engine.say(event.message)
-            engine.runAndWait()
+            # "Repeat that" — re-speak the last spoken message.
+            if event.type == "repeat":
+                msg = get_last_spoken()
+                if msg:
+                    engine.say(msg)
+                    engine.runAndWait()
+            else:
+                _set_last_spoken(event.message)
+                engine.say(event.message)
+                engine.runAndWait()
         except Exception:
             # Never let a pyttsx3 failure kill the consumer thread.
             pass
@@ -76,11 +107,14 @@ if __name__ == "__main__":
 
     print("Publishing LOW → NORMAL → CRITICAL (should be spoken in reverse priority order)...")
     event_bus.publish(Event("Scene caption: a corridor ahead", Priority.LOW, "caption", "scene"))
-    time.sleep(0.05)
+    # time.sleep(0.05)
     event_bus.publish(Event("Obstacle ahead", Priority.NORMAL, "obstacle", "vision"))
     time.sleep(0.05)
     event_bus.publish(Event("Warning: object approaching fast", Priority.CRITICAL, "collision", "vision"))
-
+    event_bus.publish(Event("Scene caption: a corridor ahead", Priority.LOW, "caption", "scene"))
+    # time.sleep(0.05)
+    event_bus.publish(Event("Obstacle ahead", Priority.NORMAL, "obstacle", "vision"))
+    
     print("Waiting 25 s for speech to finish. Listen for order: CRITICAL, NORMAL, LOW.")
-    time.sleep(25)
+    time.sleep(10)
     print("Standalone test done.")

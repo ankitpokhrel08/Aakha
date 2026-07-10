@@ -123,13 +123,13 @@ if __name__ == "__main__":
     """Standalone test: OCR a provided image file and confirm timing <500ms.
 
     Usage:
-        TEST_IMAGE=/path/to/image.jpg env_aakha/bin/python vision/ocr.py
+        TEST_IMAGE=/path/to/image.jpg env_aakha/bin/python visuals/ocr.py
     """
     from audio.consumer import start_consumer
 
     test_image_path = os.environ.get("TEST_IMAGE")
     if not test_image_path or not os.path.exists(test_image_path):
-        print("Usage: TEST_IMAGE=/path/to/image.jpg python vision/ocr.py")
+        print("Usage: TEST_IMAGE=/path/to/image.jpg python visuals/ocr.py")
         print("Image should contain some readable text for a meaningful test.")
         sys.exit(1)
 

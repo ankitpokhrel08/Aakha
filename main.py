@@ -3,8 +3,8 @@
 Thread layout after Dev 2 merges:
   _vision_producer  — Tier 1 stub (dev1/detection will replace this)
   _audio_consumer   — pyttsx3 priority-queue consumer (audio/consumer.py)
-  _scene_caption    — Moondream2 background captioning (vision/scene_caption.py)
-  _ocr              — Tesseract on Enter keypress (vision/ocr.py)
+  _scene_caption    — Moondream2 background captioning (visuals/scene_caption.py)
+  _ocr              — Tesseract on Enter keypress (visuals/ocr.py)
   _voice_trigger    — Vosk wake-word + MediaPipe Hands (audio/voice_trigger.py)
 
 Shared frame slot:
@@ -102,8 +102,8 @@ def start_workers() -> list[threading.Thread]:
     """Start all daemon workers and record them in WORKER_THREADS."""
     from audio.consumer import start_consumer
     from audio.voice_trigger import start_voice_trigger_thread
-    from vision.ocr import start_ocr_thread
-    from vision.scene_caption import start_scene_caption_thread
+    from visuals.ocr import start_ocr_thread
+    from visuals.scene_caption import start_scene_caption_thread
 
     WORKER_THREADS.clear()
 
