@@ -8,6 +8,10 @@ __pycache__/
 .venv/
 venv/
 env/
+myenv/
+
+# Local runtime settings — each machine flips its own toggles, don't commit
+config.json
 
 # Models / weights (downloaded per-machine, not committed)
 *.onnx
