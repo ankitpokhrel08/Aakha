@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 env/
+env_aakha/
 
 # Models / weights (downloaded per-machine, not committed)
 *.onnx
@@ -25,3 +26,6 @@ CLAUDE.md
 Context.txt
 PROGRESS.md
 .venv/
+
+# Vosk model zip and extracted folder
+vosk-model-*

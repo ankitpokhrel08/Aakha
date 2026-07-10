@@ -25,6 +25,7 @@ pyttsx3==2.99                # offline TTS (NSSpeechSynthesizer on macOS)
 
 # --- Tier 2: scene captioning (Moondream2 via HF) ---
 transformers==5.13.0
+accelerate                   # required by transformers device_map support
 einops==0.8.2                # required by the Moondream2 model code
 
 # --- Tier 3: OCR + voice trigger ("what am I holding") ---
