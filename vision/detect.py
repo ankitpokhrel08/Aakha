@@ -645,17 +645,28 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                     if chosen.key == "clear":     # the one-shot actually went out
                         clear_announced = True
 
-                # Steady 1 Hz on-track beep while there is genuinely NOTHING to
-                # report — emitted directly (bypassing the arbiter's 2s beat) as a
-                # non-verbal heartbeat the consumer renders as a beep. The beep
-                # means "all clear", so it's suppressed whenever the arbiter has any
-                # real cue to speak (a left/right side object, crosswalk, path hint,
-                # ...) — those take priority; only the "path is clear"/blocked
-                # path_state filler doesn't count. This stops the beep from talking
-                # over (and falsely reassuring past) a side detection.
+                # Steady 1 Hz on-track beep — a non-verbal "the whole near lane is
+                # clear, keep walking" pulse, emitted directly (bypassing the
+                # arbiter's 2s beat) as a heartbeat the consumer renders as a beep.
+                # It must mean *genuinely clear*, so it is suppressed whenever:
+                #   - the depth monitor says the path is blocked (a wall/dead-end),
+                #   - ANYTHING stands in the full walking corridor — including a
+                #     mid-lane object that hasn't yet entered the shorter ahead zone
+                #     we actually speak about (that object gets no candidate, so the
+                #     has_cue check below wouldn't catch it — this is what made the
+                #     beep reassure the user while something sat in their path), or
+                #   - the arbiter has any real cue queued (side object, crosswalk,
+                #     traffic light, path hint); only "path is clear"/blocked
+                #     path_state filler doesn't count.
+                # When it's NOT clear the beep stops and the reason is spoken
+                # ("path blocked", the obstacle/direction cue) so the user turns.
+                in_path = any(
+                    d["cls"] != TRAFFIC_LIGHT_ID
+                    and corridor.contains(d["cx"], d["box"][3], width, h_)
+                    for d in dets)
                 has_cue = any(c.type != "path_state" for c in last_cands)
-                if (ahead_clear and not has_cue
-                        and (now - last_beep_t) >= ON_TRACK_BEEP_GAP):
+                path_clear = not blocked and not in_path and not has_cue
+                if path_clear and (now - last_beep_t) >= ON_TRACK_BEEP_GAP:
                     event_bus.publish(Event(
                         message="", priority=Priority.LOW, type="heartbeat",
                         source="vision", data={"beep": True}))
