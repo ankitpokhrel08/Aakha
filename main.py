@@ -110,6 +110,18 @@ def get_incoming_frame() -> Optional[np.ndarray]:
         return _incoming_frame
 
 
+def clear_incoming_frame() -> None:
+    """Empty the pushed-frame slot so the vision loop goes idle.
+
+    Called by the server when navigation is toggled OFF. The vision loop reads
+    frames via ``get_incoming_frame`` (push mode); once this is None it hits the
+    ``frame is None`` branch in ``vision_loop`` and sleeps instead of
+    re-processing the last frame forever. No vision-side change needed."""
+    global _incoming_frame
+    with _incoming_lock:
+        _incoming_frame = None
+
+
 # ---------------------------------------------------------------------------
 # Annotated frame slot — written by Tier 1 (overlay drawn), read by the server
 # /monitor MJPEG stream so you can watch detections live on the laptop.
