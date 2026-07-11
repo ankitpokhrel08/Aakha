@@ -123,6 +123,55 @@ def clear_incoming_frame() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Voice-session flag — True while the user is holding to talk / a voice command
+# is being handled. The phone signals this over /control (voice_start/voice_end);
+# the server sets it here. Tier 1 reads it to hush the on-track heartbeat beep so
+# it doesn't tick over a spoken command (V1). Kept here (not in server.py) so the
+# vision loop can read it without importing the web layer.
+# ---------------------------------------------------------------------------
+_voice_lock = threading.Lock()
+_voice_active = False
+
+
+def set_voice_active(on: bool) -> None:
+    """Called by the server when a voice session starts (True) / ends (False)."""
+    global _voice_active
+    with _voice_lock:
+        _voice_active = bool(on)
+
+
+def get_voice_active() -> bool:
+    """True while a voice command is being recorded / handled."""
+    with _voice_lock:
+        return _voice_active
+
+
+# ---------------------------------------------------------------------------
+# Navigation-guidance gate — True while the user is actively navigating; False
+# when paused (app started & camera still streaming, but no obstacle/beep/path
+# guidance). The phone drives this over /control: tap = navigate, and after a
+# voice command it goes to paused (never auto-resumes). Kept separate from frame
+# flow so the camera keeps streaming while paused — that's what lets a voice
+# command still see the live frame. Defaults True so `python main.py` (local
+# webcam, no server) navigates out of the box; the server sets it False on boot.
+# ---------------------------------------------------------------------------
+_nav_lock = threading.Lock()
+_nav_active = True
+
+
+def set_nav_active(on: bool) -> None:
+    global _nav_active
+    with _nav_lock:
+        _nav_active = bool(on)
+
+
+def get_nav_active() -> bool:
+    """True while navigation guidance should be published (not paused)."""
+    with _nav_lock:
+        return _nav_active
+
+
+# ---------------------------------------------------------------------------
 # Annotated frame slot — written by Tier 1 (overlay drawn), read by the server
 # /monitor MJPEG stream so you can watch detections live on the laptop.
 # ---------------------------------------------------------------------------
@@ -188,6 +237,8 @@ def _vision_producer() -> None:
             on_frame=set_latest_frame,
             on_detections=_on_detections,
             on_annotated=set_annotated_frame,  # feed the /monitor live view
+            voice_active=get_voice_active,     # hush guidance during voice cmds
+            nav_active=get_nav_active,         # mute guidance while paused
         )
     except Exception as exc:  # camera missing, permission denied, source ended
         print(f"[vision] loop stopped ({exc}); thread idling")
