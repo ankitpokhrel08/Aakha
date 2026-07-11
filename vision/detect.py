@@ -37,6 +37,7 @@ from shared.bus import event_bus
 from shared.events import Event, Priority
 from vision.collision import CollisionMonitor
 from vision.crosswalk import CrosswalkDetector
+from vision.depth import FreeSpaceMonitor
 from vision.guidance import (
     DANGER, DANGER_DEFAULT, Candidate, Corridor, GuidanceArbiter, display_name)
 from vision.path import PathGuide, annotate_path
@@ -49,6 +50,11 @@ MODEL_ONNX = "yolo11n.onnx"
 CONF = 0.35          # detection confidence floor
 IMG_SIZE = 640       # inference / export resolution
 DEBOUNCE_SECONDS = 2.0  # min gap between repeated alerts for the same thing
+# Push mode only: keep the ~2s guidance beat alive across short frame stalls
+# (phone/network jitter) by re-running the arbiter on the last scene. Beyond this
+# many seconds without a fresh frame the feed is considered lost and we go silent
+# rather than speak indefinitely-stale guidance.
+STALE_SCENE_LIMIT = 4.0
 
 # Detect ALL COCO classes: the confident ones are spoken by name, everything
 # else in the path is announced as a generic "object" — so Nepal obstacles that
@@ -223,11 +229,13 @@ def announce_traffic_lights(frame, dets: list[dict],
                 data={"state": ann, "id": d["id"]}))
 
 
-def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs):
+def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs,
+                      blocked=False):
     """Turn this frame's signals into Candidate alerts for the arbiter.
 
     Obstacles are corridor-filtered: only those whose ground contact (bbox
-    bottom-centre) lies inside the walking corridor can be announced.
+    bottom-centre) lies inside the walking corridor can be announced. `blocked`
+    is the monocular-depth free-space verdict (a wall / dead-end YOLO can't see).
     """
     # obstacles standing in the walking corridor (traffic lights are handled
     # separately by the light detector, not as obstacles)
@@ -253,6 +261,11 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
             Priority.NORMAL, urg, phrase_for(display_name(nd["name"]), nd["zone"]),
             "obstacle", f"obstacle:{nd['zone']}", 4.0,
             {"class": nd["name"], "zone": nd["zone"]}))
+    elif blocked:
+        # corridor is clear of COCO objects but depth says a wall / dead-end is a
+        # few steps ahead (YOLO can't see walls) — warn instead of "path is clear"
+        cands.append(Candidate(Priority.NORMAL, 1.0, "path blocked", "path_state",
+                               "blocked", 3.0, {}))
     else:
         # nothing in the path — steady reassurance so the 2s beat has content
         cands.append(Candidate(Priority.LOW, 0.1, "path is clear", "path_state",
@@ -290,7 +303,8 @@ def process_frame(frame, model: YOLO, *, publish: bool = True,
 
 
 def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
-                 crosswalk=None, path=None, corridor=None, banner=None):
+                 crosswalk=None, path=None, corridor=None, banner=None,
+                 freespace=None):
     """Draw corridor dividers, boxes+labels, crosswalk stripes, and phrases.
 
     Collision-alerted tracks are drawn thick red with an APPROACHING tag; the
@@ -313,6 +327,15 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
             gx, gy = int(d["cx"]), int(d["box"][3])
             if corridor.contains(d["cx"], d["box"][3], w, h):
                 cv2.circle(frame, (gx, gy), 5, (0, 255, 255), -1)
+
+    # free-space (monocular-depth) verdict readout, top-right
+    if freespace is not None and getattr(freespace, "available", False):
+        blocked = freespace.blocked
+        txt = f"{'WALL' if blocked else 'free'} {freespace.score:.2f}"
+        col = (0, 0, 255) if blocked else (150, 150, 150)
+        (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.putText(frame, txt, (w - tw - 10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, col, 2, cv2.LINE_AA)
 
     # path guidance (boundaries, path centre, drift cue) — under the boxes
     if path is not None:
@@ -378,7 +401,7 @@ def _show(frame) -> bool:
 def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 track: bool = True, save: Optional[str] = None,
                 crosswalk: bool = True, traffic_light: bool = True,
-                path: bool = True, guidance: bool = True,
+                path: bool = True, guidance: bool = True, freespace: bool = True,
                 frames: Optional[Callable] = None,
                 on_frame: Optional[Callable] = None,
                 on_detections: Optional[Callable] = None,
@@ -426,11 +449,16 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
     path_guide = PathGuide() if path else None
     corridor = Corridor() if guidance else None
     arbiter = GuidanceArbiter() if guidance else None
+    freespace_mon = FreeSpaceMonitor() if freespace else None
+    if freespace_mon is not None:
+        freespace_mon.start()
     writer = None
     src_fps = cap.get(cv2.CAP_PROP_FPS) if cap is not None else 0.0
     frame_no = 0
     last_banner = ""            # last message the arbiter actually spoke
     last_banner_t = float("-inf")
+    last_cands = None           # candidates from the most recent real frame
+    last_scene_t = float("-inf")  # wall-clock of that frame (for stall sustain)
     try:
         while stop_event is None or not stop_event.is_set():
             if cap is not None:
@@ -440,6 +468,15 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
             else:
                 frame = frames()
                 if frame is None:          # no pushed frame yet — wait briefly
+                    # Sustain the ~2s beat across short frame stalls using the last
+                    # scene, so cadence doesn't stretch to 5-6s on push jitter.
+                    if (publish and arbiter is not None and last_cands is not None):
+                        tnow = time.time()
+                        if tnow - last_scene_t <= STALE_SCENE_LIMIT:
+                            chosen = arbiter.select(last_cands, tnow)
+                            if chosen is not None:
+                                event_bus.publish(chosen.to_event())
+                                last_banner, last_banner_t = chosen.message, tnow
                     time.sleep(0.01)
                     continue
             frame_no += 1
@@ -459,6 +496,9 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 on_frame(frame)
             if on_detections is not None:
                 on_detections(dets)
+            # hand the frame to the background depth thread (cheap; non-blocking)
+            if freespace_mon is not None:
+                freespace_mon.submit(frame)
 
             print(f"[frame {frame_no}]")
             print_dets(dets)
@@ -502,10 +542,12 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
 
             # --- decide what to say ---
             if publish and arbiter is not None:
-                chosen = arbiter.select(
-                    _build_candidates(dets, corridor, width, h_, growths,
-                                      xres if xpub else None, light_anns, path_msgs),
-                    now)
+                blocked = freespace_mon.blocked if freespace_mon is not None else False
+                last_cands = _build_candidates(dets, corridor, width, h_, growths,
+                                               xres if xpub else None, light_anns,
+                                               path_msgs, blocked=blocked)
+                last_scene_t = now
+                chosen = arbiter.select(last_cands, now)
                 if chosen is not None:
                     event_bus.publish(chosen.to_event())
                     last_banner, last_banner_t = chosen.message, now
@@ -543,7 +585,8 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 # polluted with boxes.
                 vis = frame.copy()
                 draw_overlay(vis, dets, alert_ids, crosswalk=xres,
-                             path=path_info, corridor=corridor, banner=banner)
+                             path=path_info, corridor=corridor, banner=banner,
+                             freespace=freespace_mon)
                 if on_annotated is not None:
                     on_annotated(vis)
                 if save is not None:
@@ -556,6 +599,8 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 if show and not _show(vis):
                     break
     finally:
+        if freespace_mon is not None:
+            freespace_mon.stop()
         if cap is not None:
             cap.release()
         if writer is not None:
@@ -636,6 +681,8 @@ def main() -> None:
                     help="disable path guidance (clearest-path + off-path drift)")
     ap.add_argument("--no-guidance", action="store_true",
                     help="disable the corridor + single-slot arbiter (legacy flood)")
+    ap.add_argument("--no-freespace", action="store_true",
+                    help="disable the monocular-depth wall / dead-end detector")
     args = ap.parse_args()
     publish = not args.no_bus
     show = not args.no_show
@@ -644,6 +691,7 @@ def main() -> None:
     traffic_light = not args.no_traffic_light
     path_guidance = not args.no_path
     guidance = not args.no_guidance
+    freespace = not args.no_freespace
     class_ids = None if args.all_classes else RELEVANT_CLASS_IDS
 
     src = args.source
@@ -651,7 +699,7 @@ def main() -> None:
         vision_loop(int(src), publish=publish, show=show, track=track,
                     save=args.save, crosswalk=crosswalk,
                     traffic_light=traffic_light, path=path_guidance,
-                    guidance=guidance, class_ids=class_ids)
+                    guidance=guidance, freespace=freespace, class_ids=class_ids)
     elif Path(src).suffix.lower() in IMAGE_SUFFIXES:
         run_on_image(src, publish=publish, show=show, crosswalk=crosswalk,
                      traffic_light=traffic_light, path_guidance=path_guidance,
@@ -660,7 +708,7 @@ def main() -> None:
         vision_loop(src, publish=publish, show=show, track=track,
                     save=args.save, crosswalk=crosswalk,
                     traffic_light=traffic_light, path=path_guidance,
-                    guidance=guidance, class_ids=class_ids)
+                    guidance=guidance, freespace=freespace, class_ids=class_ids)
 
     # Standalone: show what actually landed on the bus.
     print(f"[vision] events on bus after run: {event_bus.qsize()}")

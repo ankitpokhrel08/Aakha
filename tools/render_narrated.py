@@ -49,17 +49,34 @@ def _require(tool: str) -> None:
                  f"({'brew install ffmpeg' if tool == 'ffmpeg' else 'macOS only'})")
 
 
+_SYNTH_CACHE: dict[str, np.ndarray] = {}
+
+
 def _synthesize(message: str, path: str) -> np.ndarray:
-    """Render `message` to a 22.05kHz mono WAV via `say`; return int16 samples."""
-    subprocess.run(
-        ["say", "-r", str(SAY_RATE), "--file-format=WAVE",
-         "--data-format=LEI16@22050", "-o", path, message],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    with wave.open(path, "rb") as w:
-        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-        if w.getnchannels() > 1:
-            data = data.reshape(-1, w.getnchannels())[:, 0].copy()
+    """Render `message` to 22.05kHz mono int16 via `say`, cached per phrase.
+
+    The guidance vocabulary is tiny and highly repetitive ("path is clear",
+    "path blocked", ...), so each distinct phrase is synthesized once and reused
+    — instead of one `say` per event (hundreds of calls). `say` is also bounded
+    by a timeout so a single wedged call can't hang the whole render.
+    """
+    if message in _SYNTH_CACHE:
+        return _SYNTH_CACHE[message]
+    try:
+        subprocess.run(
+            ["say", "-r", str(SAY_RATE), "--file-format=WAVE",
+             "--data-format=LEI16@22050", "-o", path, message],
+            check=True, timeout=20,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        with wave.open(path, "rb") as w:
+            data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+            if w.getnchannels() > 1:
+                data = data.reshape(-1, w.getnchannels())[:, 0].copy()
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        print(f"[render] say failed for {message!r} ({exc}); skipping clip")
+        data = np.zeros(1, dtype=np.int16)
+    _SYNTH_CACHE[message] = data
     return data
 
 
