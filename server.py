@@ -9,7 +9,8 @@ Endpoints
 GET  /            fullscreen single-button end-user page (camera + toggle)
 GET  /dashboard   sighted-teammate view: connection light + scrolling event log
 WS   /camera      browser -> server: JPEG frames, handed to on_frame() callback
-WS   /control     browser -> server: {"action": "toggle"} etc.
+WS   /control     browser -> server: {"action": "nav_on"|"nav_off"|"nav_pause"|
+                  "voice_start"|"voice_end"} etc.
 WS   /status      server -> browser: event-bus activity + per-thread heartbeats
 
 Import-safety
@@ -243,6 +244,11 @@ async def _on_startup() -> None:
             main.FRAME_SOURCE = main.get_incoming_frame
             set_frame_callback(main.push_frame)
 
+            # Start PAUSED: the app comes up asking the user to tap to start
+            # navigation. Guidance stays muted until the first nav_on. (main
+            # defaults nav_active True for the standalone `python main.py` path.)
+            main.set_nav_active(False)
+
             if not getattr(main, "WORKER_THREADS", []):
                 main.run(block=False)  # start workers, don't block the loop
                 logger.info("started main workers: %s",
@@ -274,10 +280,12 @@ async def camera_ws(ws: WebSocket) -> None:
     try:
         while True:
             frame = await ws.receive_bytes()
-            # Guard: while navigation is OFF, drain the socket but drop the frame
-            # so the pipeline stays idle even if an old client keeps streaming (A1).
-            if not STATE["active"]:
-                continue
+            # Always feed frames while the client is streaming (which it does the
+            # whole time the app is "started", navigating or paused). The pipeline
+            # keeps the latest frame + detections fresh so a voice command ("read
+            # this" / "what am I holding") can see live camera output even while
+            # navigation is paused. Guidance itself is gated separately by the
+            # nav-active flag, not by dropping frames.
             try:
                 on_frame(frame)
             except Exception:
@@ -290,35 +298,52 @@ async def camera_ws(ws: WebSocket) -> None:
 
 @app.websocket("/control")
 async def control_ws(ws: WebSocket) -> None:
-    """Receive control actions, e.g. {"action": "toggle"} from the big button."""
+    """Receive control actions from the big button.
+
+    Navigation model (camera streams continuously once the app is started):
+      nav_on    — tap to (re)enter navigation. Guidance resumes; spoken "Navigation".
+      nav_off   — tap to stop navigating. Guidance muted; spoken "Navigation off".
+      nav_pause — go to paused SILENTLY (used after a voice command completes, so
+                  navigation never auto-resumes — the user taps to resume).
+      voice_start/voice_end — hold-to-talk boundaries (mute guidance + beep).
+    """
     await ws.accept()
     try:
         while True:
             msg = await ws.receive_json()
             action = (msg or {}).get("action")
-            if action == "toggle":
-                STATE["active"] = not STATE["active"]
-                on = STATE["active"]
-                if not on:
-                    # Stop the pipeline at the source: empty the pushed-frame
-                    # slot so the vision loop idles instead of re-processing the
-                    # last frame forever (A1). The client also stops streaming.
-                    try:
-                        import main
-                        main.clear_incoming_frame()
-                    except Exception:
-                        logger.debug("could not clear incoming frame", exc_info=True)
-                # Publish to the bus so it's both spoken (TTS) and shown (dashboard).
-                event_bus.publish(
-                    Event(
-                        message="Navigation on" if on else "Navigation off",
-                        priority=Priority.LOW,
-                        type="control",
-                        source="control",
-                        data={"active": on},
+            if action in ("nav_on", "nav_off", "nav_pause"):
+                on = action == "nav_on"
+                STATE["active"] = on
+                try:
+                    import main
+                    main.set_nav_active(on)
+                    if on:
+                        main.set_voice_active(False)   # tapping into nav ends any cmd
+                except Exception:
+                    logger.debug("could not set nav_active", exc_info=True)
+                # nav_pause is silent (post-command); nav_on/nav_off are spoken.
+                if action != "nav_pause":
+                    event_bus.publish(
+                        Event(
+                            message="Navigation" if on else "Navigation off",
+                            priority=Priority.LOW,
+                            type="control",
+                            source="control",
+                            data={"active": on},
+                        )
                     )
-                )
                 await ws.send_json({"ok": True, "active": on})
+            elif action in ("voice_start", "voice_end"):
+                # Phone hold-to-talk boundaries. While a voice session is live the
+                # Tier 1 loop hushes the on-track heartbeat beep so it doesn't tick
+                # over the spoken command / its reply (V1).
+                try:
+                    import main
+                    main.set_voice_active(action == "voice_start")
+                except Exception:
+                    logger.debug("could not set voice_active", exc_info=True)
+                await ws.send_json({"ok": True})
             elif action == "get":
                 # Return current settings so a dashboard can render controls.
                 await ws.send_json({"ok": True, "config": config.to_dict()})
@@ -444,6 +469,16 @@ async def audio_ws(ws: WebSocket) -> None:
                 logger.info("audio clip received: %d bytes (~%.2fs @16kHz mono)", n, secs)
             if clip_queue is not None:
                 clip_queue.put(clip)
+                # A voice command is now executing — keep the on-track beep hushed
+                # until the consumer finishes speaking the reply (it clears the
+                # flag then). Covers the execution window even if voice_start was
+                # late/missed; the consumer, not the phone, decides when it ends.
+                if n:
+                    try:
+                        import main
+                        main.set_voice_active(True)
+                    except Exception:
+                        logger.debug("could not set voice_active", exc_info=True)
                 await ws.send_json({"ok": True, "bytes": n})
                 # A4: echo what was recognised back to phone/dashboard + console.
                 if n:
@@ -650,7 +685,8 @@ _INDEX_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-  <button id="tap" aria-label="Tap to start or stop navigation. Press and hold to speak a command.">Tap to start</button>
+  <button id="tap" aria-label="Touch to start or resume navigation. Press and hold to speak a command.">Touch to start
+navigation</button>
   <div id="hint" aria-hidden="true">camera: connecting…</div>
   <video id="v" playsinline muted autoplay></video>
   <canvas id="c"></canvas>
@@ -795,16 +831,34 @@ _INDEX_HTML = """<!doctype html>
     } catch (_) { if (terminal) endVoiceMode(); }
   });
 
-  let active = false;
+  let active = false;       // navigating (guidance on)? — driven by /control acks
+  let started = false;      // app started (camera streaming)?
   function setActive(on) {
-    if (!on) { try { speechSynthesis.cancel(); } catch (_) {} } // A2: kill queued/in-flight speech on stop
-    active = on; btn.classList.toggle("active", on); render();
+    if (!on) { try { speechSynthesis.cancel(); } catch (_) {} } // kill queued/in-flight speech on stop
+    active = on; render();
   }
   function render() {
     btn.classList.toggle("rec", recording);
-    btn.textContent = recording ? "Listening…\\n(release to send)"
-      : (active ? "Navigation ON\\ntap to stop · hold to speak"
-                : "Tap to start\\nhold to speak");
+    btn.classList.toggle("active", active);
+    btn.textContent = recording ? "Recording…\\n(release to send)"
+      : !started ? "Touch to start\\nnavigation"
+      : (active ? "Navigation\\nhold to speak"
+                : "Paused\\ntap for navigation · hold to speak");
+  }
+  // Speak an immediate gesture cue ("Recording started" / "Processing") on the
+  // phone, using the same backend as guidance (iOS: server /tts audio element;
+  // Android/desktop: Web Speech). interrupt=true so it takes the channel now.
+  function clientSpeak(text, onDone) {
+    try {
+      if (isIOS) { speakAudio(text, true, onDone || null); }
+      else {
+        speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "en-US"; u.rate = 1.05;
+        if (onDone) { u.onend = onDone; u.onerror = onDone; }
+        speechSynthesis.speak(u);
+      }
+    } catch (_) { if (onDone) onDone(); }
   }
 
   // --- voice session: hold-to-talk pauses guidance until the reply is spoken --
@@ -812,20 +866,30 @@ _INDEX_HTML = """<!doctype html>
   // path / etc.) so it can't talk over the answer. The session ends when the
   // reply utterance finishes (onend) or armVoiceTimeout fires as a safety net.
   let voiceActive = false, voiceTimer = null;
+  function sendControl(action) {
+    // Best-effort control message to the backend. UI never blocks on it.
+    const c = getControl();
+    if (c && c.readyState === OPEN) { try { c.send(JSON.stringify({ action })); } catch (_) {} }
+  }
   function enterVoiceMode() {
     voiceActive = true;
+    sendControl("voice_start");
     try { speechSynthesis.cancel(); } catch (_) {} // silence any in-flight guidance
   }
+  // End the command interaction and go to PAUSED. Navigation NEVER auto-resumes
+  // after a command — the user taps to go back to navigation. nav_pause is silent.
   function endVoiceMode() {
     if (voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; }
     if (!voiceActive) return;
     voiceActive = false;
-    hint.textContent = active ? "camera: streaming" : "tap to start · hold to speak";
+    sendControl("voice_end");
+    sendControl("nav_pause");
+    hint.textContent = "tap for navigation · hold to speak";
     render();
   }
   function armVoiceTimeout(ms) {
     if (voiceTimer) clearTimeout(voiceTimer);
-    voiceTimer = setTimeout(endVoiceMode, ms); // resume even if no reply arrives
+    voiceTimer = setTimeout(endVoiceMode, ms); // go paused even if no reply arrives
   }
 
   // --- camera stream ---
@@ -837,7 +901,7 @@ _INDEX_HTML = """<!doctype html>
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: "environment" } }, audio: false });
       video.srcObject = stream; await video.play();
-      cameraLive = true;
+      cameraLive = true; started = true; render();
       hint.textContent = "camera: streaming"; streamLoop();
     } catch (err) {
       cameraStarted = false;
@@ -846,8 +910,10 @@ _INDEX_HTML = """<!doctype html>
   }
   function streamLoop() {
     setInterval(() => {
-      if (!active) return;              // navigation OFF -> stop streaming (A1)
-      if (!video.videoWidth) return;
+      // Stream continuously once the camera is live — navigating OR paused — so a
+      // voice command always sees fresh frames (no freeze). Guidance is gated by
+      // nav-active on the server, not by withholding frames here.
+      if (!cameraLive || !video.videoWidth) return;
       const cam = getCamera();
       if (!cam || cam.readyState !== OPEN) return;
       const scale = Math.min(1, MAX_W / video.videoWidth);
@@ -880,7 +946,7 @@ _INDEX_HTML = """<!doctype html>
     if (audioCtx.state === "suspended") await audioCtx.resume();
     chunks = []; recording = true; render();
     if (navigator.vibrate) navigator.vibrate(30);
-    hint.textContent = "listening… (release to send)";
+    hint.textContent = "recording… (release to send)";
   }
   function stopRecording() {
     if (!recording) return false;
@@ -917,7 +983,10 @@ _INDEX_HTML = """<!doctype html>
     // After a 1s hold: vibrate to cue "speak now", enter voice mode (guidance
     // pauses), and begin recording. startRecording()'s own buzz is the cue.
     if (cameraLive) holdTimer = setTimeout(() => {
-      held = true; enterVoiceMode(); startRecording();
+      held = true;
+      enterVoiceMode();
+      clientSpeak("Recording started");   // announce, then capture
+      startRecording();
     }, 1000);
   });
   function endPress() {
@@ -925,16 +994,15 @@ _INDEX_HTML = """<!doctype html>
     if (held) {
       held = false;
       const sent = stopRecording();
-      // Stay muted until the spoken reply finishes (utterance onend) or the
-      // safety timeout fires — so guidance never talks over the answer. If
-      // nothing was captured, resume immediately.
-      if (sent) { hint.textContent = "processing…"; armVoiceTimeout(10000); }
-      else endVoiceMode();
+      // Say "Processing"; the result is spoken when it arrives, then we go PAUSED
+      // (never auto-resume). 10 s safety net -> paused if no reply ever comes.
+      if (sent) { clientSpeak("Processing"); hint.textContent = "processing…"; armVoiceTimeout(10000); }
+      else endVoiceMode();                // nothing captured -> straight to paused
       return;
     }
+    // Tap toggles navigation: nav_on resumes ("Navigation"), nav_off pauses it.
     if (navigator.vibrate) navigator.vibrate(20);
-    const c = getControl();
-    if (c && c.readyState === OPEN) c.send(JSON.stringify({ action: "toggle" }));
+    sendControl(active ? "nav_off" : "nav_on");
   }
   btn.addEventListener("pointerup", endPress);
   btn.addEventListener("pointercancel", () => { if (held) endPress(); });

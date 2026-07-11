@@ -38,6 +38,34 @@ from shared.events import Event, Priority
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BEEP_SOUND = os.path.join(_REPO_ROOT, "sound_asset", "Purr.mp3")
 
+# Voice-command reply types that END a voice interaction. After the consumer
+# finishes SPEAKING one of these, the laptop is done talking, so it clears the
+# voice-session flag itself — resuming the beep exactly when it should, instead
+# of depending on the phone's (differently-timed) TTS to signal "done". Mirrors
+# the phone client's REPLY_TERMINAL set.
+_VOICE_REPLY_TERMINAL = {"ocr", "held_object", "voice_no_match",
+                         "voice_error", "caption"}
+
+
+def _voice_active() -> bool:
+    """True while a voice command is being recorded / handled (set by the server
+    via main.set_voice_active). Read lazily so this module doesn't import main at
+    load time (main imports us). Never raises."""
+    try:
+        import main
+        return main.get_voice_active()
+    except Exception:
+        return False
+
+
+def _clear_voice_active() -> None:
+    """Mark the voice session over (laptop finished speaking the reply)."""
+    try:
+        import main
+        main.set_voice_active(False)
+    except Exception:
+        pass
+
 
 def _play_beep() -> None:
     """Play the calm 'you're on track' beep. Falls back to the terminal bell if
@@ -98,11 +126,20 @@ def _consumer_loop() -> None:
             elif event.type == "heartbeat":
                 # on-track reassurance beep — not speech, so don't record it as
                 # last_spoken (a "repeat that" should replay real guidance).
-                _play_beep()
+                # Gate at PLAY time too (not just at publish): a heartbeat queued
+                # in the ~1 s before the voice session was flagged would otherwise
+                # tick over the command. Drop it if a voice session is now active.
+                if not _voice_active():
+                    _play_beep()
             else:
                 _set_last_spoken(event.message)
                 engine.say(event.message)
                 engine.runAndWait()
+                # The laptop just finished speaking. If that was a voice-command
+                # reply, the interaction is over — clear the session flag so the
+                # beep resumes now, on the laptop's own clock (not the phone's).
+                if event.type in _VOICE_REPLY_TERMINAL:
+                    _clear_voice_active()
         except Exception:
             # Never let a pyttsx3 failure kill the consumer thread.
             pass

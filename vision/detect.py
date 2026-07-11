@@ -478,6 +478,8 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 on_frame: Optional[Callable] = None,
                 on_detections: Optional[Callable] = None,
                 on_annotated: Optional[Callable] = None,
+                voice_active: Optional[Callable] = None,
+                nav_active: Optional[Callable] = None,
                 class_ids: Optional[set[int]] = RELEVANT_CLASS_IDS,
                 stop_event=None) -> None:
     """Continuous capture loop for live sources (webcam / video).
@@ -546,7 +548,12 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 if frame is None:          # no pushed frame yet — wait briefly
                     # Sustain the ~2s beat across short frame stalls using the last
                     # scene, so cadence doesn't stretch to 5-6s on push jitter.
-                    if (publish and arbiter is not None and last_cands is not None):
+                    # But not while muted (voice command in progress, or navigation
+                    # paused): don't let a stalled frame replay an ambient cue.
+                    quiet = (voice_active() if voice_active is not None else False) \
+                        or (nav_active is not None and not nav_active())
+                    if (publish and arbiter is not None and last_cands is not None
+                            and not quiet):
                         tnow = time.time()
                         if tnow - last_scene_t <= STALE_SCENE_LIMIT:
                             chosen = arbiter.select(last_cands, tnow)
@@ -619,6 +626,18 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
             # --- decide what to say ---
             if publish and arbiter is not None:
                 blocked = freespace_mon.blocked if freespace_mon is not None else False
+                # Guidance is MUTED (no obstacle/side/path/collision cue, no beep)
+                # in two cases:
+                #  - voice command in progress (recording/OCR/"what am I holding"):
+                #    interrupting a command with anything creates chaos (V2); and
+                #  - navigation paused: the app is started and the camera still
+                #    streams (so a command can see the frame), but the user hasn't
+                #    tapped into navigation — guidance should stay silent until they
+                #    do. Muted here at the source, so it stops uniformly on every
+                #    consumer (laptop TTS, dashboard, phone).
+                voice_on = voice_active() if voice_active is not None else False
+                nav_on = nav_active() if nav_active is not None else True
+                muted = voice_on or not nav_on
                 # transition detect: is the straight-ahead path clear right now?
                 # (no in-ahead-corridor obstacle and no wall). Speak "path is clear"
                 # once per clear run; a beep heartbeat covers the steady clear
@@ -637,6 +656,12 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                                                ahead_corridor=ahead_corridor,
                                                announce_clear=announce_clear,
                                                heartbeat=True)
+                if muted:
+                    # Suspend navigation ENTIRELY — no obstacle/side/path cues and
+                    # no collision either. Clearing the list (vs. calling the
+                    # arbiter) also keeps its cadence/cooldown state untouched, so
+                    # guidance flows normally the instant navigation resumes.
+                    last_cands = []
                 last_scene_t = now
                 chosen = arbiter.select(last_cands, now)
                 if chosen is not None:
@@ -665,7 +690,10 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                     and corridor.contains(d["cx"], d["box"][3], width, h_)
                     for d in dets)
                 has_cue = any(c.type != "path_state" for c in last_cands)
-                path_clear = not blocked and not in_path and not has_cue
+                # Hush the metronome while muted (voice command in progress, or
+                # navigation paused) — the beep shouldn't tick then. (`muted`
+                # computed above.)
+                path_clear = not blocked and not in_path and not has_cue and not muted
                 if path_clear and (now - last_beep_t) >= ON_TRACK_BEEP_GAP:
                     event_bus.publish(Event(
                         message="", priority=Priority.LOW, type="heartbeat",

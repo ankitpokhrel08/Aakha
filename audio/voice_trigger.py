@@ -7,7 +7,7 @@ Updated scope (per PROGRESS.md):
   on it, matches against 4 fixed phrases, and dispatches the right action.
 
 The 4 commands and their actions:
-  "what am I holding"  → MediaPipe Hands + YOLO detection match → publish
+  "what am I holding"  → most prominent object over a ~2 s scan → publish
   "read this"          → trigger OCR on current frame → publish
   "describe the scene" → trigger Moondream2 caption on demand → publish
   "repeat that"        → re-speak last TTS message → publish type="repeat"
@@ -120,6 +120,75 @@ def _match_command(transcript: str) -> Optional[str]:
     return None
 
 
+# --- "what am I holding" — scan a short window, not one instant (V5) ----------
+# The old code sampled a SINGLE frame: if the hand happened to be missing (or the
+# object was between YOLO detections) in that exact frame, it wrongly answered
+# "I can't see your hand" even though the object was plainly visible. Hand
+# detection is dropped entirely — it was unreliable (kept failing to locate the
+# hand). Instead we assume the object held up to the camera is simply the most
+# PROMINENT one (closest => biggest box, and near the frame centre), scanned over
+# ~2 s and decided by majority vote so a single-frame miss can't flip the result.
+_HOLD_SCAN_SECONDS = 2.0
+_HOLD_SAMPLE_GAP = 0.12     # ~8 samples/sec of the pushed stream
+# Classes that are never a "held object" — the user / bystanders, so a body in
+# view can't be reported as what he's holding.
+_NOT_HELD = {"person"}
+
+
+def _prominence(det, w: int, h: int) -> float:
+    """How 'held up to the camera' a detection looks: mostly its size (a closer
+    object fills more of the frame), biased toward the centre."""
+    x1, y1, x2, y2 = det["bbox"]
+    area = max(0, x2 - x1) * max(0, y2 - y1)
+    if area <= 0:
+        return 0.0
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    maxd = ((w / 2.0) ** 2 + (h / 2.0) ** 2) ** 0.5 or 1.0
+    dist = ((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5
+    centrality = 1.0 - min(1.0, dist / maxd)      # 1 at centre, 0 at a corner
+    return area * (0.5 + 0.5 * centrality)         # size-dominant, centre-biased
+
+
+def _most_prominent(detections, w: int, h: int) -> Optional[str]:
+    """Label of the most prominent held-candidate object this frame, or None."""
+    best_score, best = 0.0, None
+    for det in detections:
+        if det.get("label") in _NOT_HELD:
+            continue
+        s = _prominence(det, w, h)
+        if s > best_score:
+            best_score, best = s, det.get("label")
+    return best
+
+
+def _scan_held_object(get_frame, get_detections,
+                      duration: float = _HOLD_SCAN_SECONDS) -> str:
+    """Decide what the user is holding by watching the live frame for ~`duration`
+    s and reporting the most prominent object over the window (V5).
+
+    No hand detection: the held object is taken to be the closest/most-central
+    thing in view, majority-voted across frames so a one-frame miss can't flip
+    the answer.
+    """
+    from collections import Counter
+
+    votes: "Counter[str]" = Counter()
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        frame = get_frame()
+        dets = get_detections() if get_detections is not None else None
+        if frame is not None and dets:
+            h, w = frame.shape[:2]
+            label = _most_prominent(dets, w, h)
+            if label:
+                votes[label] += 1
+        time.sleep(_HOLD_SAMPLE_GAP)
+
+    if not votes:
+        return "I don't see anything you might be holding. Hold it up to the camera."
+    return f"You are probably holding a {votes.most_common(1)[0][0]}."
+
+
 def dispatch_command(
     transcript: str,
     get_frame: Callable[[], Optional[np.ndarray]],
@@ -133,9 +202,20 @@ def dispatch_command(
     print(f"[voice_trigger] transcript: {transcript!r}")
     cmd = _match_command(transcript)
     if cmd is None:
-        print("[voice_trigger] No command matched.")
+        # V4: distinguish "heard nothing" from "heard an unknown command".
+        #   - empty transcript -> the user held but said nothing intelligible;
+        #     just a brief cue (don't dump the whole command list every time).
+        #   - real speech, no match -> offer the list of available commands.
+        # Both are terminal replies, so navigation resumes once they finish.
+        if not transcript.strip():
+            print("[voice_trigger] Nothing heard.")
+            message = "I didn't catch that."
+        else:
+            print("[voice_trigger] No command matched.")
+            message = ("I didn't understand. You can say: what am I holding, "
+                       "read this, describe the scene, or repeat that.")
         event_bus.publish(Event(
-            message="Sorry, I didn't catch that. Try: what am I holding, read this, describe the scene, or repeat that.",
+            message=message,
             priority=Priority.NORMAL,
             type="voice_no_match",
             source="voice",
@@ -187,8 +267,7 @@ def dispatch_command(
         ))
 
     elif cmd == "holding":
-        frame = get_frame()
-        if frame is None:
+        if get_frame() is None:
             event_bus.publish(Event(
                 message="Camera not ready. Try again in a moment.",
                 priority=Priority.NORMAL,
@@ -198,68 +277,10 @@ def dispatch_command(
             return
 
         try:
-            import mediapipe as mp
-            import cv2
-            mp_hands = mp.solutions.hands
-            with mp_hands.Hands(
-                static_image_mode=True,
-                max_num_hands=1,
-                min_detection_confidence=0.5,
-            ) as hands:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = hands.process(rgb)
-
-            if not result.multi_hand_landmarks:
-                event_bus.publish(Event(
-                    message="I can't see your hand. Hold the object up to the camera.",
-                    priority=Priority.NORMAL,
-                    type="held_object",
-                    source="voice",
-                ))
-                return
-
-            h, w = frame.shape[:2]
-            lm = result.multi_hand_landmarks[0].landmark
-            xs = [p.x * w for p in lm]
-            ys = [p.y * h for p in lm]
-            hand_box = (
-                max(0, int(min(xs)) - 20),
-                max(0, int(min(ys)) - 20),
-                min(w, int(max(xs)) + 20),
-                min(h, int(max(ys)) + 20),
-            )
+            message = _scan_held_object(get_frame, get_detections)
         except Exception as e:
-            print(f"[voice_trigger] MediaPipe error: {e}")
-            event_bus.publish(Event(
-                message="Could not detect hand position.",
-                priority=Priority.NORMAL,
-                type="held_object",
-                source="voice",
-            ))
-            return
-
-        label = None
-        if get_detections is not None:
-            detections = get_detections()
-            if detections:
-                best_iou, best_label = 0.1, None
-                for det in detections:
-                    bx = det["bbox"]
-                    xA, yA = max(hand_box[0], bx[0]), max(hand_box[1], bx[1])
-                    xB, yB = min(hand_box[2], bx[2]), min(hand_box[3], bx[3])
-                    inter = max(0, xB - xA) * max(0, yB - yA)
-                    if inter:
-                        aA = (hand_box[2]-hand_box[0]) * (hand_box[3]-hand_box[1])
-                        aB = (bx[2]-bx[0]) * (bx[3]-bx[1])
-                        iou = inter / (aA + aB - inter)
-                        if iou > best_iou:
-                            best_iou, best_label = iou, det["label"]
-                label = best_label
-
-        if label:
-            message = f"You are holding a {label}."
-        else:
-            message = "I can see your hand but cannot identify the object."
+            print(f"[voice_trigger] holding scan error: {e}")
+            message = "Could not check what you are holding."
         event_bus.publish(Event(
             message=message,
             priority=Priority.NORMAL,
@@ -292,7 +313,7 @@ def _voice_trigger_thread(
             transcript = transcribe_clip(audio_bytes, model=model)
             dispatch_command(transcript, get_frame, get_detections)
         except Exception as exc:
-            # A dispatch failure (bad clip, OCR/MediaPipe error) must never kill
+            # A dispatch failure (bad clip, OCR/object-scan error) must never kill
             # this thread — if it dies, every future voice command is silent,
             # which is the exact A7 symptom. Log, speak a fallback, keep going.
             print(f"[voice_trigger] dispatch failed: {exc}")
