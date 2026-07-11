@@ -612,22 +612,48 @@ _INDEX_HTML = """<!doctype html>
 
   // --- on-device TTS: speak spoken-type bus events (phone is the voice) ---
   const SPEAK = new Set(["obstacle","collision","crosswalk","traffic_light","path",
-    "path_drift","ocr","caption","held_object","voice_no_match","voice_heard","control"]);
+    "path_drift","ocr","caption","held_object","voice_no_match","voice_heard","control",
+    "caption_request","voice_error"]);
   // Events that speak even when navigation is OFF: on/off confirmations and
   // user-requested voice responses (the command is explicit, so echo/answer it).
-  const ALWAYS_SPEAK = new Set(["control","voice_heard","voice_no_match","ocr","held_object"]);
+  // caption_request = "describing the scene now" ack; voice_error = command failed.
+  const ALWAYS_SPEAK = new Set(["control","voice_heard","voice_no_match","ocr",
+    "held_object","caption_request","voice_error"]);
+  // Replies to an explicit voice command. During a voice session these are the
+  // only things spoken; ambient guidance is paused so the answer is heard clean.
+  const REPLY = new Set(["ocr","held_object","voice_no_match","voice_error",
+    "caption","caption_request","voice_heard"]);
+  // A reply that ENDS the voice session once it finishes speaking (guidance then
+  // resumes). caption_request/voice_heard are spoken but keep the session open
+  // (they're acks — the real answer is still coming).
+  const REPLY_TERMINAL = new Set(["ocr","held_object","voice_no_match",
+    "voice_error","caption"]);
   connect("/status", (e) => {
     let p; try { p = JSON.parse(e.data); } catch (_) { return; }
     if (p.kind !== "event" || !p.message || !SPEAK.has(p.type)) return;
-    // A2/A4: when navigation is OFF, silence autonomous guidance but still speak
-    // control confirmations and user-requested voice responses.
-    if (!active && !ALWAYS_SPEAK.has(p.type)) return;
+    const isReply = REPLY.has(p.type) || p.type === "control";
+    // Voice session active: pause ambient guidance so the reply is heard
+    // cleanly (this is what was talking over the OCR answer). CRITICAL collision
+    // still speaks — safety overrides a voice query.
+    if (voiceActive && !isReply && p.priority_name !== "CRITICAL") return;
+    // Outside a voice session: when navigation is OFF, silence autonomous
+    // guidance but still speak control confirmations and voice responses.
+    if (!voiceActive && !active && !ALWAYS_SPEAK.has(p.type)) return;
     try {
       if (p.priority_name === "CRITICAL") speechSynthesis.cancel(); // danger interrupts
       const u = new SpeechSynthesisUtterance(p.message);
       u.rate = p.priority_name === "CRITICAL" ? 1.2 : 1.05;
+      if (voiceActive && REPLY_TERMINAL.has(p.type)) {
+        // Once the answer STARTS speaking, cancel the safety timeout so only
+        // onend can end the session — guidance can never resume mid-answer,
+        // however long the reply takes. The timeout then only guards the case
+        // where no reply ever arrives.
+        u.onstart = () => { if (voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; } };
+        u.onend = endVoiceMode;      // resume guidance once the answer is spoken
+        u.onerror = endVoiceMode;
+      }
       speechSynthesis.speak(u);
-    } catch (_) {}
+    } catch (_) { if (voiceActive && REPLY_TERMINAL.has(p.type)) endVoiceMode(); }
   });
 
   let active = false;
@@ -640,6 +666,27 @@ _INDEX_HTML = """<!doctype html>
     btn.textContent = recording ? "Listening…\\n(release to send)"
       : (active ? "Navigation ON\\ntap to stop · hold to speak"
                 : "Tap to start\\nhold to speak");
+  }
+
+  // --- voice session: hold-to-talk pauses guidance until the reply is spoken --
+  // While voiceActive, the /status handler drops ambient guidance (obstacle /
+  // path / etc.) so it can't talk over the answer. The session ends when the
+  // reply utterance finishes (onend) or armVoiceTimeout fires as a safety net.
+  let voiceActive = false, voiceTimer = null;
+  function enterVoiceMode() {
+    voiceActive = true;
+    try { speechSynthesis.cancel(); } catch (_) {} // silence any in-flight guidance
+  }
+  function endVoiceMode() {
+    if (voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; }
+    if (!voiceActive) return;
+    voiceActive = false;
+    hint.textContent = active ? "camera: streaming" : "tap to start · hold to speak";
+    render();
+  }
+  function armVoiceTimeout(ms) {
+    if (voiceTimer) clearTimeout(voiceTimer);
+    voiceTimer = setTimeout(endVoiceMode, ms); // resume even if no reply arrives
   }
 
   // --- camera stream ---
@@ -697,14 +744,16 @@ _INDEX_HTML = """<!doctype html>
     hint.textContent = "listening… (release to send)";
   }
   function stopRecording() {
-    if (!recording) return;
+    if (!recording) return false;
     recording = false; render();
     let len = 0; chunks.forEach((c) => len += c.length);
     const pcm = new Int16Array(len); let off = 0;
     chunks.forEach((c) => { pcm.set(c, off); off += c.length; });
     const a = getAudio();
-    if (a && a.readyState === OPEN && pcm.length) { a.send(pcm.buffer); hint.textContent = "command sent"; }
-    else hint.textContent = "nothing captured";
+    if (a && a.readyState === OPEN && pcm.length) {
+      a.send(pcm.buffer); hint.textContent = "command sent"; return true;
+    }
+    hint.textContent = "nothing captured"; return false;
   }
 
   // --- single fullscreen target: tap = toggle nav, hold = talk ---
@@ -712,14 +761,26 @@ _INDEX_HTML = """<!doctype html>
   btn.addEventListener("pointerdown", (ev) => {
     ev.preventDefault(); held = false; startCamera();
     // Arm hold-to-talk only once the camera is live. On the FIRST press the
-    // camera-permission dialog is still up; without this guard the 350ms timer
-    // fires during the dialog and drops the user into the recording screen,
-    // stealing the first tap. First tap should just start navigation.
-    if (cameraLive) holdTimer = setTimeout(() => { held = true; startRecording(); }, 350);
+    // camera-permission dialog is still up; without this guard the timer fires
+    // during the dialog and steals the first tap. First tap just starts nav.
+    // After a 1s hold: vibrate to cue "speak now", enter voice mode (guidance
+    // pauses), and begin recording. startRecording()'s own buzz is the cue.
+    if (cameraLive) holdTimer = setTimeout(() => {
+      held = true; enterVoiceMode(); startRecording();
+    }, 1000);
   });
   function endPress() {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
-    if (held) { stopRecording(); held = false; return; }
+    if (held) {
+      held = false;
+      const sent = stopRecording();
+      // Stay muted until the spoken reply finishes (utterance onend) or the
+      // safety timeout fires — so guidance never talks over the answer. If
+      // nothing was captured, resume immediately.
+      if (sent) { hint.textContent = "processing…"; armVoiceTimeout(10000); }
+      else endVoiceMode();
+      return;
+    }
     if (navigator.vibrate) navigator.vibrate(20);
     const c = getControl();
     if (c && c.readyState === OPEN) c.send(JSON.stringify({ action: "toggle" }));

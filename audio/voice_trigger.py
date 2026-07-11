@@ -136,7 +136,7 @@ def dispatch_command(
         print("[voice_trigger] No command matched.")
         event_bus.publish(Event(
             message="Sorry, I didn't catch that. Try: what am I holding, read this, describe the scene, or repeat that.",
-            priority=Priority.LOW,
+            priority=Priority.NORMAL,
             type="voice_no_match",
             source="voice",
         ))
@@ -148,7 +148,7 @@ def dispatch_command(
         # Consumer re-speaks last_spoken when it sees type="repeat".
         event_bus.publish(Event(
             message="",
-            priority=Priority.LOW,
+            priority=Priority.NORMAL,
             type="repeat",
             source="voice",
         ))
@@ -159,7 +159,7 @@ def dispatch_command(
         if frame is None:
             event_bus.publish(Event(
                 message="Camera not ready. Try again in a moment.",
-                priority=Priority.LOW,
+                priority=Priority.NORMAL,
                 type="ocr",
                 source="voice",
             ))
@@ -169,7 +169,7 @@ def dispatch_command(
         message = f"Text reads: {text}" if text else "No text found in the frame."
         event_bus.publish(Event(
             message=message,
-            priority=Priority.LOW,
+            priority=Priority.NORMAL,
             type="ocr",
             source="voice",
         ))
@@ -181,7 +181,7 @@ def dispatch_command(
         sc._last_caption_requested = True  # sentinel checked in scene_caption
         event_bus.publish(Event(
             message="Describing the scene now.",
-            priority=Priority.LOW,
+            priority=Priority.NORMAL,
             type="caption_request",
             source="voice",
         ))
@@ -191,7 +191,7 @@ def dispatch_command(
         if frame is None:
             event_bus.publish(Event(
                 message="Camera not ready. Try again in a moment.",
-                priority=Priority.LOW,
+                priority=Priority.NORMAL,
                 type="held_object",
                 source="voice",
             ))
@@ -212,7 +212,7 @@ def dispatch_command(
             if not result.multi_hand_landmarks:
                 event_bus.publish(Event(
                     message="I can't see your hand. Hold the object up to the camera.",
-                    priority=Priority.LOW,
+                    priority=Priority.NORMAL,
                     type="held_object",
                     source="voice",
                 ))
@@ -232,7 +232,7 @@ def dispatch_command(
             print(f"[voice_trigger] MediaPipe error: {e}")
             event_bus.publish(Event(
                 message="Could not detect hand position.",
-                priority=Priority.LOW,
+                priority=Priority.NORMAL,
                 type="held_object",
                 source="voice",
             ))
@@ -262,7 +262,7 @@ def dispatch_command(
             message = "I can see your hand but cannot identify the object."
         event_bus.publish(Event(
             message=message,
-            priority=Priority.LOW,
+            priority=Priority.NORMAL,
             type="held_object",
             source="voice",
         ))
@@ -288,9 +288,25 @@ def _voice_trigger_thread(
         except queue.Empty:
             continue
 
-        transcript = transcribe_clip(audio_bytes, model=model)
-        dispatch_command(transcript, get_frame, get_detections)
-        clip_queue.task_done()
+        try:
+            transcript = transcribe_clip(audio_bytes, model=model)
+            dispatch_command(transcript, get_frame, get_detections)
+        except Exception as exc:
+            # A dispatch failure (bad clip, OCR/MediaPipe error) must never kill
+            # this thread — if it dies, every future voice command is silent,
+            # which is the exact A7 symptom. Log, speak a fallback, keep going.
+            print(f"[voice_trigger] dispatch failed: {exc}")
+            try:
+                event_bus.publish(Event(
+                    message="Sorry, something went wrong with that command.",
+                    priority=Priority.NORMAL,
+                    type="voice_error",
+                    source="voice",
+                ))
+            except Exception:
+                pass
+        finally:
+            clip_queue.task_done()
 
 
 def start_voice_trigger_thread(
