@@ -8,14 +8,11 @@ __pycache__/
 .venv/
 venv/
 env/
-<<<<<<< HEAD
 myenv/
+env_aakha/
 
 # Local runtime settings — each machine flips its own toggles, don't commit
 config.json
-=======
-env_aakha/
->>>>>>> aman
 
 # Models / weights (downloaded per-machine, not committed)
 *.onnx
@@ -31,13 +28,11 @@ models/
 # Platform tools and guide
 CLAUDE.md
 Context.txt
+ISSUES.md
 PROGRESS.md
-.venv/
 
-<<<<<<< HEAD
-assets/annotated.mp4
-assets/cars.mp4
-=======
+# Generated demo media (large; regenerate with tools/render_narrated.py)
+assets
+
 # Vosk model zip and extracted folder
 vosk-model-*
->>>>>>> aman

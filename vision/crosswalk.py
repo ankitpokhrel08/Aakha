@@ -39,13 +39,30 @@ def _near_horizontal(x1: int, y1: int, x2: int, y2: int, max_angle: float) -> bo
     return ang <= max_angle or ang >= 180 - max_angle
 
 
+def _looks_zebra(roi_bgr, bright_frac_min: float = 0.12,
+                 std_min: float = 20.0, max_sat: float = 90.0) -> bool:
+    """Black-and-white gate: bright white bands present (a real zebra has lots
+    of white paint), high brightness contrast (alternating light/dark bands),
+    and achromatic (low saturation). Rejects coloured or low-contrast patterns
+    like door panels, tiles or faint road paint."""
+    if roi_bgr.size == 0:
+        return False
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    val = hsv[:, :, 2]
+    sat = hsv[:, :, 1]
+    bright = float((val > 170).sum()) / float(val.size)
+    return (bright >= bright_frac_min
+            and float(val.std()) >= std_min
+            and float(sat.mean()) < max_sat)
+
+
 class CrosswalkDetector:
-    def __init__(self, roi_top_frac: float = 0.5, max_angle: float = 25.0,
-                 min_bands: int = 4, n_bands_grid: int = 12,
-                 canny_lo: int = 50, canny_hi: int = 150,
-                 hough_thresh: int = 50, min_len_frac: float = 0.15,
+    def __init__(self, roi_top_frac: float = 0.5, roi_side_frac: float = 0.66,
+                 max_angle: float = 25.0, min_bands: int = 5,
+                 n_bands_grid: int = 12, canny_lo: int = 50, canny_hi: int = 150,
+                 hough_thresh: int = 50, min_len_frac: float = 0.22,
                  max_gap: int = 20, persist_frames: int = 5,
-                 persist_hits: int = 3, cooldown: float = 4.0) -> None:
+                 persist_hits: int = 4, cooldown: float = 4.0) -> None:
         """
         roi_top_frac  -- analyze the frame below this fraction of height
         max_angle     -- max degrees off horizontal for a stripe edge
@@ -57,6 +74,7 @@ class CrosswalkDetector:
         cooldown      -- min seconds between published crosswalk events
         """
         self.roi_top_frac = roi_top_frac
+        self.roi_side_frac = roi_side_frac    # analyze only the central column
         self.max_angle = max_angle
         self.min_bands = min_bands
         self.n_bands_grid = n_bands_grid
@@ -74,7 +92,11 @@ class CrosswalkDetector:
         """Pure per-frame detection (no temporal state)."""
         h, w = frame.shape[:2]
         roi_top = int(h * self.roi_top_frac)
-        roi = frame[roi_top:h, :]
+        # only the central column — a crosswalk you're about to step on fills the
+        # lower-centre; road lane-markings off to the sides no longer count.
+        x0 = int(w * (1 - self.roi_side_frac) / 2)
+        x1 = w - x0
+        roi = frame[roi_top:h, x0:x1]
         if roi.size == 0:
             return CrosswalkResult(found=False, roi_top=roi_top)
 
@@ -83,7 +105,7 @@ class CrosswalkDetector:
         edges = cv2.Canny(gray, self.canny_lo, self.canny_hi)
         segments = cv2.HoughLinesP(
             edges, 1, math.pi / 180, self.hough_thresh,
-            minLineLength=int(w * self.min_len_frac), maxLineGap=self.max_gap)
+            minLineLength=int((x1 - x0) * self.min_len_frac), maxLineGap=self.max_gap)
 
         lines: list = []
         bands: set[int] = set()
@@ -92,14 +114,15 @@ class CrosswalkDetector:
         if segments is not None:
             for seg in segments:
                 # OpenCV 4 returns (1,4) rows, OpenCV 5 returns (4,); ravel handles both
-                x1, y1, x2, y2 = (int(v) for v in np.ravel(seg)[:4])
-                if not _near_horizontal(x1, y1, x2, y2, self.max_angle):
+                sx1, sy1, sx2, sy2 = (int(v) for v in np.ravel(seg)[:4])
+                if not _near_horizontal(sx1, sy1, sx2, sy2, self.max_angle):
                     continue
-                # back to full-frame coordinates
-                lines.append((x1, y1 + roi_top, x2, y2 + roi_top))
-                bands.add(min(y1, y2) // band_h)
+                # back to full-frame coordinates (add the central-crop x offset)
+                lines.append((sx1 + x0, sy1 + roi_top, sx2 + x0, sy2 + roi_top))
+                bands.add(min(sy1, sy2) // band_h)
 
-        found = len(bands) >= self.min_bands
+        # parallel horizontal bands AND a black-and-white zebra appearance
+        found = len(bands) >= self.min_bands and _looks_zebra(roi)
         return CrosswalkResult(found=found, lines=lines,
                                roi_top=roi_top, n_bands=len(bands))
 

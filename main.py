@@ -21,6 +21,7 @@ Shared detections slot:
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Optional
@@ -77,20 +78,108 @@ def set_latest_detections(detections: list) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tier 1 stub — replaced by dev1/detection
+# Incoming frame slot — written by the server (phone camera), read by Tier 1
+# ---------------------------------------------------------------------------
+_incoming_lock = threading.Lock()
+_incoming_frame: Optional[np.ndarray] = None
+
+# When set (server.py does this on startup), the vision thread consumes pushed
+# frames from here instead of opening a local camera. Left None for the
+# `python main.py` local-webcam / VISION_SOURCE path.
+FRAME_SOURCE = None
+
+
+def push_frame(jpeg_or_array) -> None:
+    """Feed a frame into the pipeline. Accepts raw JPEG bytes (decoded here) or a
+    BGR numpy array. server.py wires its /camera websocket to this."""
+    global _incoming_frame
+    frame = jpeg_or_array
+    if isinstance(jpeg_or_array, (bytes, bytearray)):
+        import cv2
+        frame = cv2.imdecode(np.frombuffer(jpeg_or_array, dtype=np.uint8),
+                             cv2.IMREAD_COLOR)
+    if frame is None:
+        return
+    with _incoming_lock:
+        _incoming_frame = frame
+
+
+def get_incoming_frame() -> Optional[np.ndarray]:
+    """Latest frame pushed by the server (phone camera), or None."""
+    with _incoming_lock:
+        return _incoming_frame
+
+
+# ---------------------------------------------------------------------------
+# Annotated frame slot — written by Tier 1 (overlay drawn), read by the server
+# /monitor MJPEG stream so you can watch detections live on the laptop.
+# ---------------------------------------------------------------------------
+_annotated_lock = threading.Lock()
+_annotated_frame: Optional[np.ndarray] = None
+
+
+def set_annotated_frame(frame: np.ndarray) -> None:
+    global _annotated_frame
+    with _annotated_lock:
+        _annotated_frame = frame
+
+
+def get_annotated_frame() -> Optional[np.ndarray]:
+    """Latest frame with detection overlay drawn, or None."""
+    with _annotated_lock:
+        return _annotated_frame
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 producer — real YOLO11n vision loop (dev1/detection)
 # ---------------------------------------------------------------------------
 def _vision_producer() -> None:
-    """Tier 1 stub. dev1/detection replaces this with live YOLO11n + ByteTrack.
+    """Run the real Tier 1 vision loop: YOLO11n detection + ByteTrack collision
+    + crosswalk + traffic-light, publishing events to the bus and feeding the
+    shared frame/detection slots for Tier 2/3.
 
-    Publishes one test event on startup so the smoke test sees qsize() > 0 even
-    before the real vision branch merges.
+    Falls back to idling (thread stays alive) if the camera can't be opened, so
+    the smoke test and the Tier 2/3 threads that read get_latest_frame() don't
+    die on a headless machine.
     """
+    # Startup marker so smoke_test sees qsize() > 0 immediately, and the
+    # dashboard shows the vision thread came up.
     event_bus.publish(Event(
         message="Vision thread started.",
         priority=Priority.LOW,
         type="system",
-        source="vision_stub",
+        source="vision",
     ))
+
+    def _on_detections(dets: list) -> None:
+        # Adapt Tier 1 dicts to the shape voice_trigger expects.
+        set_latest_detections([
+            {"label": d["name"], "bbox": tuple(int(v) for v in d["box"])}
+            for d in dets
+        ])
+
+    # Source is the webcam (0) by default; point it at a file for testing with
+    #   VISION_SOURCE=assets/cars.mp4 python main.py
+    src_env = os.environ.get("VISION_SOURCE", "0")
+    source = int(src_env) if src_env.isdigit() else src_env
+
+    try:
+        from config import config
+        from vision.detect import vision_loop
+        vision_loop(
+            source=source,
+            frames=FRAME_SOURCE,  # push mode when the server fed phone frames
+            show=False,           # GUI must stay on the main thread on macOS
+            publish=True,
+            crosswalk=config.crosswalk_detection,
+            traffic_light=config.traffic_light_detection,
+            on_frame=set_latest_frame,
+            on_detections=_on_detections,
+            on_annotated=set_annotated_frame,  # feed the /monitor live view
+        )
+    except Exception as exc:  # camera missing, permission denied, source ended
+        print(f"[vision] loop stopped ({exc}); thread idling")
+
     while True:
         time.sleep(1.0)
 
@@ -107,12 +196,13 @@ def start_workers() -> list[threading.Thread]:
 
     WORKER_THREADS.clear()
 
-    # Tier 1 stub (keeps smoke test happy until dev1 lands).
-    vision_stub = threading.Thread(
+    # Tier 1 real vision loop (local camera, VISION_SOURCE file, or pushed
+    # frames when FRAME_SOURCE was set by the server).
+    vision_thread = threading.Thread(
         target=_vision_producer, name="_vision_producer", daemon=True
     )
-    vision_stub.start()
-    WORKER_THREADS.append(vision_stub)
+    vision_thread.start()
+    WORKER_THREADS.append(vision_thread)
 
     # Tier 2 audio consumer.
     WORKER_THREADS.append(start_consumer())
