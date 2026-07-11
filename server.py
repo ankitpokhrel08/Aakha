@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from typing import Any, Callable, Optional
 
@@ -514,6 +515,27 @@ async def icon_512() -> Response:
     return Response(web_assets.icon_png(512), media_type="image/png")
 
 
+# On-track heartbeat beep, played in the browser on type="heartbeat" events while
+# navigation is ON (the phone is the speaker) — mirrors audio/consumer's laptop
+# afplay beep. Same Purr.mp3 the offline demo videos use (sound_asset/).
+_BEEP_BYTES: Optional[bytes] = None
+
+
+@app.get("/beep.mp3")
+async def beep_mp3() -> Response:
+    global _BEEP_BYTES
+    if _BEEP_BYTES is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "sound_asset", "Purr.mp3")
+        try:
+            with open(path, "rb") as f:
+                _BEEP_BYTES = f.read()
+        except OSError:
+            _BEEP_BYTES = b""
+    return Response(_BEEP_BYTES, media_type="audio/mpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # --------------------------------------------------------------------------- #
 # Live monitor — watch the phone's stream WITH detection overlay on the laptop.
 # --------------------------------------------------------------------------- #
@@ -628,9 +650,19 @@ _INDEX_HTML = """<!doctype html>
   // (they're acks — the real answer is still coming).
   const REPLY_TERMINAL = new Set(["ocr","held_object","voice_no_match",
     "voice_error","caption"]);
+  // On-track heartbeat beep — the phone is the speaker (mirrors the laptop's
+  // afplay beep). Unlocked on the first tap below (iOS needs a user gesture).
+  const beep = new Audio("/beep.mp3"); beep.preload = "auto";
+  function playBeep() {
+    try { beep.currentTime = 0; beep.play().catch(() => {}); } catch (_) {}
+  }
   connect("/status", (e) => {
     let p; try { p = JSON.parse(e.data); } catch (_) { return; }
-    if (p.kind !== "event" || !p.message || !SPEAK.has(p.type)) return;
+    if (p.kind !== "event") return;
+    // heartbeat: non-verbal "you're on track" cue — beep (only while navigating),
+    // never spoken. Handled before the SPEAK guard (it has no message).
+    if (p.type === "heartbeat") { if (active) playBeep(); return; }
+    if (!p.message || !SPEAK.has(p.type)) return;
     const isReply = REPLY.has(p.type) || p.type === "control";
     // Voice session active: pause ambient guidance so the reply is heard
     // cleanly (this is what was talking over the OCR answer). CRITICAL collision
@@ -760,6 +792,9 @@ _INDEX_HTML = """<!doctype html>
   let holdTimer = null, held = false;
   btn.addEventListener("pointerdown", (ev) => {
     ev.preventDefault(); held = false; startCamera();
+    // iOS: unlock the beep element inside a user gesture so later programmatic
+    // playBeep() (on heartbeat events) is allowed.
+    try { beep.play().then(() => { beep.pause(); beep.currentTime = 0; }).catch(() => {}); } catch (_) {}
     // Arm hold-to-talk only once the camera is live. On the FIRST press the
     // camera-permission dialog is still up; without this guard the timer fires
     // during the dialog and steals the first tap. First tap just starts nav.
@@ -895,7 +930,9 @@ _DASHBOARD_HTML = """<!doctype html>
     ws.onmessage = (e) => {
       let p; try { p = JSON.parse(e.data); } catch (_) { return; }
       if (p.kind === "heartbeat") { threads.set(p.thread, { alive: p.alive }); renderThreads(); }
-      else if (p.kind === "event") { addEvent(p); }
+      // skip the on-track audio-beep events (type "heartbeat") — they'd flood the
+      // log at 1/s and carry no message; they're an audio cue, not a log entry.
+      else if (p.kind === "event" && p.type !== "heartbeat") { addEvent(p); }
     };
   }
   connect();

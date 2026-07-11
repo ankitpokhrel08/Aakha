@@ -42,6 +42,39 @@ SAY_RATE = 190      # words per minute for `say`
 CLIP_GAP = 0.12     # min silence between spoken clips (s)
 PRIORITY_RANK = {"CRITICAL": 0, "NORMAL": 1, "LOW": 2}
 
+# On-track heartbeat beep: vision publishes empty-message type="heartbeat" events
+# (~1 Hz while the path is clear). We bake the actual Purr.mp3 into the narration
+# track at those timestamps so the demo video *sounds* like the live app. Callers
+# tag such events with BEEP_MARKER as the "message" so _synthesize returns the beep
+# clip instead of speech.
+BEEP_MARKER = "\x00on-track-beep"
+_BEEP_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "sound_asset", "Purr.mp3")
+
+
+def _load_beep() -> np.ndarray:
+    """Decode the on-track beep (sound_asset/Purr.mp3) to SR mono int16, cached
+    (reuses _SYNTH_CACHE keyed by BEEP_MARKER). Silent 1-sample clip on failure."""
+    if BEEP_MARKER in _SYNTH_CACHE:
+        return _SYNTH_CACHE[BEEP_MARKER]
+    data = np.zeros(1, dtype=np.int16)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wavp = tf.name
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", _BEEP_SRC, "-ac", "1", "-ar", str(SR),
+             "-sample_fmt", "s16", wavp],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with wave.open(wavp, "rb") as w:
+            data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+            if w.getnchannels() > 1:
+                data = data.reshape(-1, w.getnchannels())[:, 0].copy()
+        os.unlink(wavp)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[render] on-track beep load failed ({exc}); beeps will be silent")
+    _SYNTH_CACHE[BEEP_MARKER] = data
+    return data
+
 
 def _require(tool: str) -> None:
     if shutil.which(tool) is None:
@@ -60,6 +93,8 @@ def _synthesize(message: str, path: str) -> np.ndarray:
     — instead of one `say` per event (hundreds of calls). `say` is also bounded
     by a timeout so a single wedged call can't hang the whole render.
     """
+    if message == BEEP_MARKER:            # the on-track beep, not speech
+        return _load_beep()
     if message in _SYNTH_CACHE:
         return _SYNTH_CACHE[message]
     try:
@@ -97,7 +132,9 @@ def _run_vision(source: str, annotated_path: str) -> tuple[list, float, int]:
 
     def capturing_publish(event) -> None:
         t = state["idx"] / fps
-        events.append((t, event.priority.name, event.message))
+        # heartbeat events carry no speech; bake the on-track beep instead
+        msg = BEEP_MARKER if getattr(event, "type", "") == "heartbeat" else event.message
+        events.append((t, event.priority.name, msg))
         original_publish(event)
 
     event_bus.publish = capturing_publish  # type: ignore[assignment]

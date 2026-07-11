@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import queue
+import subprocess
 import threading
 import time
 
@@ -27,6 +28,25 @@ import pyttsx3
 
 from shared.bus import event_bus
 from shared.events import Event, Priority
+
+# On-track heartbeat beep (vision publishes type="heartbeat" while the path is
+# clear — see vision/detect.py). Rendered as a short, calm system sound instead
+# of speech, on this same single audio thread so it never overlaps the voice.
+# On-track beep sound, kept in the repo (sound_asset/) so it's portable and easy
+# to swap — candidates live there; Purr is the current pick (~800 Hz, soft rounded
+# timbre, short) per navigation-audio research (mid-range, gentle, non-alarming).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BEEP_SOUND = os.path.join(_REPO_ROOT, "sound_asset", "Purr.mp3")
+
+
+def _play_beep() -> None:
+    """Play the calm 'you're on track' beep. Falls back to the terminal bell if
+    afplay / the sound file isn't available (e.g. non-macOS). Never raises."""
+    try:
+        subprocess.run(["afplay", _BEEP_SOUND], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError):
+        print("\a", end="", flush=True)
 
 # ---------------------------------------------------------------------------
 # Shared "repeat that" buffer — written by consumer, read by anyone who needs
@@ -75,6 +95,10 @@ def _consumer_loop() -> None:
                 if msg:
                     engine.say(msg)
                     engine.runAndWait()
+            elif event.type == "heartbeat":
+                # on-track reassurance beep — not speech, so don't record it as
+                # last_spoken (a "repeat that" should replay real guidance).
+                _play_beep()
             else:
                 _set_last_spoken(event.message)
                 engine.say(event.message)

@@ -72,7 +72,10 @@ def _narrate(events: list[tuple[float, str, str, str]], dur: float,
     reusing render_narrated's timeline logic. Returns the WAV path, or None."""
     if not events:
         return None
-    clips = [(t, prio, msg) for (t, prio, _typ, msg) in events]   # drop 'type'
+    # drop 'type', but turn heartbeat events into the on-track beep clip so the
+    # annotated video sounds like the live app (1 Hz Purr while the path is clear)
+    clips = [(t, prio, narr.BEEP_MARKER if typ == "heartbeat" else msg)
+             for (t, prio, typ, msg) in events]
     placed = narr._place_clips(clips, workdir)
     wav = os.path.join(workdir, "narration.wav")
     narr._build_track(placed, dur, wav)
