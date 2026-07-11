@@ -129,7 +129,7 @@ class GuidanceArbiter:
       itself reads as "nothing new", which is calmer than repeating "path clear".
     """
 
-    def __init__(self, min_gap: float = 2.0, critical_gap: float = 1.5) -> None:
+    def __init__(self, min_gap: float = 1.4, critical_gap: float = 1.5) -> None:
         self.min_gap = min_gap
         self.critical_gap = critical_gap
         self._last_emit = float("-inf")          # last emit of anything

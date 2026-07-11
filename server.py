@@ -536,6 +536,59 @@ async def beep_mp3() -> Response:
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
+# Server-side speech for iOS. iOS Safari blocks the Web Speech API (especially as
+# an installed PWA), so the phone can't speak guidance itself — but it plays HTML5
+# <audio> fine (the beep proves it). So we synthesize each phrase here with macOS
+# `say` (same engine the offline demo videos use) and the iOS client fetches +
+# plays it through the same audio channel as the beep. Android keeps using its
+# native (working) SpeechSynthesis, so it never hits this route.
+_TTS_CACHE: dict[str, bytes] = {}
+_TTS_MAX = 256                      # cap the cache (ambient vocab is small; OCR varies)
+
+
+def _synth_tts(text: str) -> bytes:
+    """`say` -> WAV bytes for one phrase, cached by text. Blocking; call in an
+    executor so it never stalls the event loop."""
+    key = (text or "").strip()
+    if not key:
+        return b""
+    cached = _TTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import subprocess
+    import tempfile
+    path = None
+    data = b""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            path = tf.name
+        subprocess.run(
+            ["say", "-r", "190", "--file-format=WAVE",
+             "--data-format=LEI16@22050", "-o", path, key],
+            check=True, timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(path, "rb") as f:
+            data = f.read()
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("tts synth failed for %r: %s", key, exc)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if len(_TTS_CACHE) < _TTS_MAX:
+        _TTS_CACHE[key] = data
+    return data
+
+
+@app.get("/tts")
+async def tts(text: str = "") -> Response:
+    data = await asyncio.get_event_loop().run_in_executor(None, _synth_tts, text)
+    return Response(data, media_type="audio/wav",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # --------------------------------------------------------------------------- #
 # Live monitor — watch the phone's stream WITH detection overlay on the laptop.
 # --------------------------------------------------------------------------- #
@@ -653,8 +706,38 @@ _INDEX_HTML = """<!doctype html>
   // On-track heartbeat beep — the phone is the speaker (mirrors the laptop's
   // afplay beep). Unlocked on the first tap below (iOS needs a user gesture).
   const beep = new Audio("/beep.mp3"); beep.preload = "auto";
+  let ttsUnlocked = false;   // iOS: SpeechSynthesis primed on first tap (M3)
   function playBeep() {
     try { beep.currentTime = 0; beep.play().catch(() => {}); } catch (_) {}
+  }
+  // iOS Safari blocks the Web Speech API (silent, esp. as an installed PWA), but
+  // plays HTML5 <audio> — so on iOS we speak guidance via the server's /tts synth
+  // through this element (blessed on first tap, like the beep). Android/desktop
+  // keep their native SpeechSynthesis. iPadOS reports as Mac, so also check touch.
+  const isIOS = /iP(hone|od|ad)/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const SILENT_WAV = "data:audio/wav;base64,UklGRiwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQgAAACAgICAgICAgA==";
+  const voice = new Audio(); voice.preload = "auto";
+  let voiceBusy = false, voicePending = null;   // 1-deep freshest-cue queue (iOS)
+  // Speak `text` via the server synth and, when it ends, immediately play the
+  // freshest cue that arrived while it was busy (voicePending) — this gives
+  // laptop-like BACK-TO-BACK continuity instead of gaps, while only ever holding
+  // ONE queued cue (the newest) so speech can't fall behind reality. interrupt
+  // (CRITICAL / a reply) cuts whatever's playing. onEnd fires on a terminal reply.
+  function speakAudio(text, interrupt, onEnd) {
+    if (interrupt) { try { voice.pause(); } catch (_) {} }
+    voiceBusy = true;
+    const done = () => {
+      voiceBusy = false;
+      if (onEnd) onEnd();
+      if (voicePending) {                 // drain the queued cue back-to-back
+        const nx = voicePending; voicePending = null;
+        speakAudio(nx.text, false, nx.onEnd);
+      }
+    };
+    voice.onended = done; voice.onerror = done;
+    voice.src = "/tts?text=" + encodeURIComponent(text);
+    voice.play().catch(done);
   }
   connect("/status", (e) => {
     let p; try { p = JSON.parse(e.data); } catch (_) { return; }
@@ -671,21 +754,45 @@ _INDEX_HTML = """<!doctype html>
     // Outside a voice session: when navigation is OFF, silence autonomous
     // guidance but still speak control confirmations and voice responses.
     if (!voiceActive && !active && !ALWAYS_SPEAK.has(p.type)) return;
+    // Mobile TTS is a single ~real-time channel; the pipeline can offer cues
+    // faster than they can actually be spoken. Keep the voice CURRENT without
+    // dropping everything (the phone's "missed many sounds" symptom):
+    //   - CRITICAL (looming danger) always interrupts whatever's speaking.
+    //   - Any other ambient cue is SKIPPED while something is already being
+    //     spoken — NOT queued (which lags behind reality) and NOT cut off
+    //     mid-word (that swallowed cues). The arbiter re-offers the next relevant
+    //     cue on its next beat, so nothing important stays lost for long.
+    //   - Replies (OCR answer, etc.) are never skipped; their channel was
+    //     already cleared when the voice session started.
+    const critical = p.priority_name === "CRITICAL";
+    const terminal = voiceActive && REPLY_TERMINAL.has(p.type);
+    // A terminal reply, once it starts, clears the safety timeout so guidance
+    // can't resume mid-answer; its end resumes guidance.
+    const onEnd = terminal ? endVoiceMode : null;
     try {
-      if (p.priority_name === "CRITICAL") speechSynthesis.cancel(); // danger interrupts
-      const u = new SpeechSynthesisUtterance(p.message);
-      u.rate = p.priority_name === "CRITICAL" ? 1.2 : 1.05;
-      if (voiceActive && REPLY_TERMINAL.has(p.type)) {
-        // Once the answer STARTS speaking, cancel the safety timeout so only
-        // onend can end the session — guidance can never resume mid-answer,
-        // however long the reply takes. The timeout then only guards the case
-        // where no reply ever arrives.
-        u.onstart = () => { if (voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; } };
-        u.onend = endVoiceMode;      // resume guidance once the answer is spoken
-        u.onerror = endVoiceMode;
+      if (isIOS) {
+        // iOS: speak through the server synth (Web Speech API is silent here).
+        // CRITICAL / replies interrupt now; an ordinary cue that lands mid-clip is
+        // held as the freshest-pending one (overwriting any older wait) and played
+        // back-to-back when the current clip ends — continuous, but never stale.
+        if (terminal && voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; }
+        if (!critical && !isReply && voiceBusy) { voicePending = { text: p.message, onEnd }; return; }
+        speakAudio(p.message, critical || isReply, onEnd);
+      } else {
+        if (critical) speechSynthesis.cancel();
+        else if (!isReply && (speechSynthesis.speaking || speechSynthesis.pending)) return;
+        speechSynthesis.resume();   // Android Chrome sometimes suspends the queue
+        const u = new SpeechSynthesisUtterance(p.message);
+        u.lang = "en-US";    // Android Chrome silently drops utterances with no lang
+        u.rate = critical ? 1.2 : 1.05;
+        if (terminal) {
+          u.onstart = () => { if (voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; } };
+          u.onend = endVoiceMode;      // resume guidance once the answer is spoken
+          u.onerror = endVoiceMode;
+        }
+        speechSynthesis.speak(u);
       }
-      speechSynthesis.speak(u);
-    } catch (_) { if (voiceActive && REPLY_TERMINAL.has(p.type)) endVoiceMode(); }
+    } catch (_) { if (terminal) endVoiceMode(); }
   });
 
   let active = false;
@@ -792,9 +899,18 @@ _INDEX_HTML = """<!doctype html>
   let holdTimer = null, held = false;
   btn.addEventListener("pointerdown", (ev) => {
     ev.preventDefault(); held = false; startCamera();
-    // iOS: unlock the beep element inside a user gesture so later programmatic
-    // playBeep() (on heartbeat events) is allowed.
+    // iOS blesses each <audio> element individually: an element may only be
+    // play()'d later from a non-gesture callback if it was first play()'d inside
+    // a user gesture. So bless BOTH the beep and the server-TTS voice element on
+    // this first tap by playing a near-silent clip through each.
     try { beep.play().then(() => { beep.pause(); beep.currentTime = 0; }).catch(() => {}); } catch (_) {}
+    if (!ttsUnlocked) {
+      try {
+        voice.src = SILENT_WAV;
+        voice.play().then(() => { voice.pause(); voice.currentTime = 0; }).catch(() => {});
+        ttsUnlocked = true;
+      } catch (_) {}
+    }
     // Arm hold-to-talk only once the camera is live. On the FIRST press the
     // camera-permission dialog is still up; without this guard the timer fires
     // during the dialog and steals the first tap. First tap just starts nav.
