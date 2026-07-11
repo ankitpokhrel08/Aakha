@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -272,6 +273,10 @@ async def camera_ws(ws: WebSocket) -> None:
     try:
         while True:
             frame = await ws.receive_bytes()
+            # Guard: while navigation is OFF, drain the socket but drop the frame
+            # so the pipeline stays idle even if an old client keeps streaming (A1).
+            if not STATE["active"]:
+                continue
             try:
                 on_frame(frame)
             except Exception:
@@ -293,6 +298,15 @@ async def control_ws(ws: WebSocket) -> None:
             if action == "toggle":
                 STATE["active"] = not STATE["active"]
                 on = STATE["active"]
+                if not on:
+                    # Stop the pipeline at the source: empty the pushed-frame
+                    # slot so the vision loop idles instead of re-processing the
+                    # last frame forever (A1). The client also stops streaming.
+                    try:
+                        import main
+                        main.clear_incoming_frame()
+                    except Exception:
+                        logger.debug("could not clear incoming frame", exc_info=True)
                 # Publish to the bus so it's both spoken (TTS) and shown (dashboard).
                 event_bus.publish(
                     Event(
@@ -342,6 +356,66 @@ async def control_ws(ws: WebSocket) -> None:
         logger.exception("control ws error")
 
 
+# --------------------------------------------------------------------------- #
+# Voice-command transcript echo (A4).
+#
+# The voice_trigger thread transcribes each clip and dispatches the command, but
+# it's frozen this round and never puts the *raw transcript* on the bus — only
+# the command result. So we can't tell whether recognition happened, or what it
+# heard. To echo it, the server transcribes the same clip with its own cached
+# Vosk model and publishes a `voice_heard` event ("Heard: ...") that shows on the
+# dashboard, speaks on the phone, and logs to the server console. The extra
+# transcription is cheap (voice commands are user-initiated and rare).
+# --------------------------------------------------------------------------- #
+_voice_model = None
+_voice_model_lock = threading.Lock()
+_voice_model_tried = False
+
+
+def _get_voice_model():
+    """Load the Vosk model once (lazily) for the transcript echo, or None."""
+    global _voice_model, _voice_model_tried
+    with _voice_model_lock:
+        if _voice_model is None and not _voice_model_tried:
+            _voice_model_tried = True
+            try:
+                from audio.voice_trigger import _load_vosk_model
+                _voice_model = _load_vosk_model()  # None if model dir absent
+            except Exception:
+                logger.exception("could not load Vosk model for transcript echo")
+        return _voice_model
+
+
+def _transcribe_for_echo(clip: bytes) -> Optional[str]:
+    """Transcribe a clip for the echo (runs in an executor thread). Returns the
+    transcript, "" if nothing recognised, or None if no model is available."""
+    model = _get_voice_model()
+    if model is None:
+        return None
+    try:
+        from audio.voice_trigger import transcribe_clip
+        return transcribe_clip(clip, model=model)
+    except Exception:
+        logger.exception("echo transcription failed")
+        return None
+
+
+async def _echo_transcript(clip: bytes) -> None:
+    """Transcribe off the event loop and publish a `voice_heard` echo event."""
+    loop = asyncio.get_running_loop()
+    transcript = await loop.run_in_executor(None, _transcribe_for_echo, clip)
+    if transcript is None:
+        return  # no model — voice_trigger already logs the download hint
+    heard = transcript if transcript else "(nothing recognised)"
+    logger.info("heard: %s", heard)
+    event_bus.publish(Event(
+        message=f"Heard: {heard}",
+        priority=Priority.LOW,
+        type="voice_heard",
+        source="voice",
+    ))
+
+
 @app.websocket("/audio")
 async def audio_ws(ws: WebSocket) -> None:
     """Receive short voice-command clips (raw 16 kHz mono PCM16) from the phone
@@ -360,9 +434,19 @@ async def audio_ws(ws: WebSocket) -> None:
     try:
         while True:
             clip = await ws.receive_bytes()
+            # A3: confirm capture — log size + duration (16 kHz mono PCM16 => 2 bytes/sample).
+            n = len(clip)
+            secs = n / 2 / 16000
+            if n == 0:
+                logger.warning("audio clip EMPTY (0 bytes) — capture produced nothing")
+            else:
+                logger.info("audio clip received: %d bytes (~%.2fs @16kHz mono)", n, secs)
             if clip_queue is not None:
                 clip_queue.put(clip)
-                await ws.send_json({"ok": True, "bytes": len(clip)})
+                await ws.send_json({"ok": True, "bytes": n})
+                # A4: echo what was recognised back to phone/dashboard + console.
+                if n:
+                    asyncio.create_task(_echo_transcript(clip))
     except WebSocketDisconnect:
         logger.info("audio client disconnected")
     except Exception:
@@ -528,10 +612,16 @@ _INDEX_HTML = """<!doctype html>
 
   // --- on-device TTS: speak spoken-type bus events (phone is the voice) ---
   const SPEAK = new Set(["obstacle","collision","crosswalk","traffic_light","path",
-    "path_drift","ocr","caption","held_object","voice_no_match","control"]);
+    "path_drift","ocr","caption","held_object","voice_no_match","voice_heard","control"]);
+  // Events that speak even when navigation is OFF: on/off confirmations and
+  // user-requested voice responses (the command is explicit, so echo/answer it).
+  const ALWAYS_SPEAK = new Set(["control","voice_heard","voice_no_match","ocr","held_object"]);
   connect("/status", (e) => {
     let p; try { p = JSON.parse(e.data); } catch (_) { return; }
     if (p.kind !== "event" || !p.message || !SPEAK.has(p.type)) return;
+    // A2/A4: when navigation is OFF, silence autonomous guidance but still speak
+    // control confirmations and user-requested voice responses.
+    if (!active && !ALWAYS_SPEAK.has(p.type)) return;
     try {
       if (p.priority_name === "CRITICAL") speechSynthesis.cancel(); // danger interrupts
       const u = new SpeechSynthesisUtterance(p.message);
@@ -541,7 +631,10 @@ _INDEX_HTML = """<!doctype html>
   });
 
   let active = false;
-  function setActive(on) { active = on; btn.classList.toggle("active", on); render(); }
+  function setActive(on) {
+    if (!on) { try { speechSynthesis.cancel(); } catch (_) {} } // A2: kill queued/in-flight speech on stop
+    active = on; btn.classList.toggle("active", on); render();
+  }
   function render() {
     btn.classList.toggle("rec", recording);
     btn.textContent = recording ? "Listening…\\n(release to send)"
@@ -550,7 +643,7 @@ _INDEX_HTML = """<!doctype html>
   }
 
   // --- camera stream ---
-  let cameraStarted = false;
+  let cameraStarted = false, cameraLive = false;
   async function startCamera() {
     if (cameraStarted) return;
     cameraStarted = true;
@@ -558,6 +651,7 @@ _INDEX_HTML = """<!doctype html>
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: "environment" } }, audio: false });
       video.srcObject = stream; await video.play();
+      cameraLive = true;
       hint.textContent = "camera: streaming"; streamLoop();
     } catch (err) {
       cameraStarted = false;
@@ -566,6 +660,7 @@ _INDEX_HTML = """<!doctype html>
   }
   function streamLoop() {
     setInterval(() => {
+      if (!active) return;              // navigation OFF -> stop streaming (A1)
       if (!video.videoWidth) return;
       const cam = getCamera();
       if (!cam || cam.readyState !== OPEN) return;
@@ -616,7 +711,11 @@ _INDEX_HTML = """<!doctype html>
   let holdTimer = null, held = false;
   btn.addEventListener("pointerdown", (ev) => {
     ev.preventDefault(); held = false; startCamera();
-    holdTimer = setTimeout(() => { held = true; startRecording(); }, 350);
+    // Arm hold-to-talk only once the camera is live. On the FIRST press the
+    // camera-permission dialog is still up; without this guard the 350ms timer
+    // fires during the dialog and drops the user into the recording screen,
+    // stealing the first tap. First tap should just start navigation.
+    if (cameraLive) holdTimer = setTimeout(() => { held = true; startRecording(); }, 350);
   });
   function endPress() {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
