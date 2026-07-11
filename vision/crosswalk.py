@@ -39,8 +39,8 @@ def _near_horizontal(x1: int, y1: int, x2: int, y2: int, max_angle: float) -> bo
     return ang <= max_angle or ang >= 180 - max_angle
 
 
-def _looks_zebra(roi_bgr, bright_frac_min: float = 0.12,
-                 std_min: float = 20.0, max_sat: float = 90.0) -> bool:
+def _looks_zebra(roi_bgr, bright_frac_min: float = 0.18,
+                 std_min: float = 28.0, max_sat: float = 80.0) -> bool:
     """Black-and-white gate: bright white bands present (a real zebra has lots
     of white paint), high brightness contrast (alternating light/dark bands),
     and achromatic (low saturation). Rejects coloured or low-contrast patterns
@@ -58,11 +58,11 @@ def _looks_zebra(roi_bgr, bright_frac_min: float = 0.12,
 
 class CrosswalkDetector:
     def __init__(self, roi_top_frac: float = 0.5, roi_side_frac: float = 0.66,
-                 max_angle: float = 25.0, min_bands: int = 5,
+                 max_angle: float = 20.0, min_bands: int = 8,
                  n_bands_grid: int = 12, canny_lo: int = 50, canny_hi: int = 150,
-                 hough_thresh: int = 50, min_len_frac: float = 0.22,
-                 max_gap: int = 20, persist_frames: int = 5,
-                 persist_hits: int = 4, cooldown: float = 4.0) -> None:
+                 hough_thresh: int = 60, min_len_frac: float = 0.28,
+                 max_gap: int = 20, persist_frames: int = 8,
+                 persist_hits: int = 6, cooldown: float = 8.0) -> None:
         """
         roi_top_frac  -- analyze the frame below this fraction of height
         max_angle     -- max degrees off horizontal for a stripe edge

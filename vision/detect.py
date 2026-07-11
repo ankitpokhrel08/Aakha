@@ -5,7 +5,7 @@ tracking) -> for each relevant box compute its horizontal zone
 (left / ahead / right) -> publish Events onto the shared bus:
 
   * obstacle      (NORMAL)   nearest object + direction
-  * collision     (CRITICAL) a tracked object looming / approaching fast
+  * collision     (CRITICAL) a tracked object looming / gap closing fast
   * crosswalk     (NORMAL)   zebra stripes detected ahead (Canny + Hough)
   * traffic_light (NORMAL)   red / amber / green state of a traffic-light box
 
@@ -55,6 +55,20 @@ DEBOUNCE_SECONDS = 2.0  # min gap between repeated alerts for the same thing
 # many seconds without a fresh frame the feed is considered lost and we go silent
 # rather than speak indefinitely-stale guidance.
 STALE_SCENE_LIMIT = 4.0
+# B5: objects just OUTSIDE the corridor but within this fraction of frame width
+# beside it are announced with a left/right direction ("person on your left").
+# Wide enough to catch something you'd clip; narrow enough to ignore things across
+# the street. One such cue per beat (LOW), so the anti-flood cadence is unchanged.
+SIDE_BAND_FRAC = 0.15
+# Clear-path feedback. Live app: speak "path is clear" ONCE when the path becomes
+# clear (a real state transition), then a steady 1 Hz on-track BEEP so the user
+# knows they're still tracked without a repeated phrase (a heartbeat Event the
+# audio consumer renders as a beep, not speech). The beep is a metronome emitted
+# directly (see vision_loop) — it must bypass the guidance arbiter, whose 2s beat
+# would otherwise cap it. Offline tools that synthesise every message as speech
+# instead get a throttled spoken "path is clear" every CLEAR_FILLER_GAP seconds.
+ON_TRACK_BEEP_GAP = 1.0     # seconds between on-track beeps (1 Hz reassurance pulse)
+CLEAR_FILLER_GAP = 8.0      # spoken "path is clear" cadence for non-heartbeat callers
 
 # Detect ALL COCO classes: the confident ones are spoken by name, everything
 # else in the path is announced as a generic "object" — so Nepal obstacles that
@@ -95,6 +109,15 @@ def phrase_for(name: str, zone: str) -> str:
     if zone == "ahead":
         return f"{name} ahead"
     return f"{name} on your {zone}"
+
+
+def collision_phrase(name: str, zone: str) -> str:
+    """CRITICAL closing-warning phrase. The trigger is bbox *growth* = the gap is
+    closing, which happens whether the object moves toward the user OR the user
+    walks toward a static object. "approaching" wrongly implied the object was
+    moving; "closing on X" is neutral to who's moving and fits both cases."""
+    dirn = "" if zone == "ahead" else f" on your {zone}"
+    return f"closing on {name}{dirn}"
 
 
 class Debounce:
@@ -194,7 +217,7 @@ def announce_collisions(dets: list[dict], frame_area: float,
         alerted.add(d["id"])
         if publish:
             event_bus.publish(Event(
-                message=f"{d['name']} approaching fast",
+                message=collision_phrase(d["name"], d["zone"]),
                 priority=Priority.CRITICAL,
                 type="collision",
                 source="vision",
@@ -230,18 +253,25 @@ def announce_traffic_lights(frame, dets: list[dict],
 
 
 def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs,
-                      blocked=False):
+                      blocked=False, ahead_corridor=None, announce_clear=False,
+                      heartbeat=False):
     """Turn this frame's signals into Candidate alerts for the arbiter.
 
     Obstacles are corridor-filtered: only those whose ground contact (bbox
     bottom-centre) lies inside the walking corridor can be announced. `blocked`
     is the monocular-depth free-space verdict (a wall / dead-end YOLO can't see).
+
+    Two corridors: the straight-ahead "X ahead" / collision cue uses the shorter
+    `ahead_corridor` (fires only when something is genuinely near); the side
+    (left/right) cues use the full-length `corridor` (longer reach). If
+    `ahead_corridor` is None it falls back to `corridor` (single-corridor callers).
     """
-    # obstacles standing in the walking corridor (traffic lights are handled
-    # separately by the light detector, not as obstacles)
+    ahead = ahead_corridor if ahead_corridor is not None else corridor
+    # obstacles standing in the (shorter) straight-ahead corridor (traffic lights
+    # are handled separately by the light detector, not as obstacles)
     in_corr = [d for d in dets
                if d["cls"] != TRAFFIC_LIGHT_ID
-               and corridor.contains(d["cx"], d["box"][3], w, h)]
+               and ahead.contains(d["cx"], d["box"][3], w, h)]
     cands: list = []
     # CRITICAL — looming obstacles that are in the corridor
     for d in in_corr:
@@ -249,7 +279,7 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
         if g is not None:
             cands.append(Candidate(
                 Priority.CRITICAL, 10.0 + g,
-                f"{display_name(d['name'])} approaching fast", "collision",
+                collision_phrase(display_name(d['name']), d['zone']), "collision",
                 f"collision:{d['id']}", 3.0,
                 {"class": d["name"], "id": d["id"], "growth_per_sec": round(g, 2)}))
     # NORMAL — the single most-pressing in-corridor obstacle (closeness * danger)
@@ -259,20 +289,53 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
         urg = (nd["box"][3] / h) * DANGER.get(nd["name"], DANGER_DEFAULT)
         cands.append(Candidate(
             Priority.NORMAL, urg, phrase_for(display_name(nd["name"]), nd["zone"]),
-            "obstacle", f"obstacle:{nd['zone']}", 4.0,
+            "obstacle", f"obstacle:{nd['zone']}", 2.0,
             {"class": nd["name"], "zone": nd["zone"]}))
     elif blocked:
         # corridor is clear of COCO objects but depth says a wall / dead-end is a
         # few steps ahead (YOLO can't see walls) — warn instead of "path is clear"
         cands.append(Candidate(Priority.NORMAL, 1.0, "path blocked", "path_state",
                                "blocked", 3.0, {}))
+    elif heartbeat:
+        # live app: a clear path is quiet reassurance, not a repeated phrase.
+        # Speak "path is clear" once on the transition (announce_clear); the steady
+        # 1 Hz on-track beep is emitted directly in vision_loop (it bypasses this
+        # arbiter, whose 2s beat would cap it), so it isn't a candidate here.
+        if announce_clear:
+            cands.append(Candidate(Priority.LOW, 0.2, "path is clear",
+                                   "path_state", "clear", 2.0, {}))
     else:
-        # nothing in the path — steady reassurance so the 2s beat has content
+        # offline/narration callers (no beep channel): a throttled spoken "path is
+        # clear" reassurance so a clear path still has occasional content
         cands.append(Candidate(Priority.LOW, 0.1, "path is clear", "path_state",
-                               "clear", 2.0, {}))
+                               "clear", CLEAR_FILLER_GAP, {}))
+    # LOW — side object: nearest thing just left/right of the corridor, near
+    # enough to clip. Advisory only (never overrides an in-path hazard), and we
+    # add at most ONE per frame ranked by proximity*danger, so the arbiter's
+    # one-cue-per-beat cadence keeps this from re-flooding the way the pre-corridor
+    # code did. Its 0.5 urgency beats the "path is clear" filler and path hints.
+    side = []
+    for d in dets:
+        if d["cls"] == TRAFFIC_LIGHT_ID:
+            continue
+        if corridor.contains(d["cx"], d["box"][3], w, h):
+            continue                          # already an in-corridor obstacle
+        half = corridor.half_width_at(d["box"][3], w, h)
+        if half is None:                      # beyond corridor depth = too far
+            continue
+        if abs(d["cx"] - w / 2.0) <= half + SIDE_BAND_FRAC * w:
+            side.append(d)
+    if side:
+        sd = max(side, key=lambda d: (d["box"][3] / h)
+                 * DANGER.get(d["name"], DANGER_DEFAULT))
+        side_zone = "left" if sd["cx"] < w / 2.0 else "right"
+        cands.append(Candidate(
+            Priority.LOW, 0.5, phrase_for(display_name(sd["name"]), side_zone),
+            "obstacle_side", f"side:{side_zone}", 2.0,
+            {"class": sd["name"], "zone": side_zone}))
     # NORMAL — crosswalk (only when the detector's persistence already fired)
     if xres is not None:
-        cands.append(Candidate(Priority.NORMAL, 0.5, "crosswalk ahead",
+        cands.append(Candidate(Priority.NORMAL, 0.5, "zebra crossing ahead",
                                "crosswalk", "crosswalk", 8.0,
                                {"n_bands": xres.n_bands}))
     # NORMAL — traffic-light state changes
@@ -304,7 +367,7 @@ def process_frame(frame, model: YOLO, *, publish: bool = True,
 
 def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
                  crosswalk=None, path=None, corridor=None, banner=None,
-                 freespace=None):
+                 freespace=None, ahead_corridor=None):
     """Draw corridor dividers, boxes+labels, crosswalk stripes, and phrases.
 
     Collision-alerted tracks are drawn thick red with an APPROACHING tag; the
@@ -322,11 +385,20 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
     if corridor is not None:
         import numpy as _np
         pts = _np.array(corridor.polygon(w, h), dtype=_np.int32)
-        cv2.polylines(frame, [pts], True, (255, 255, 0), 2)
-        for d in dets:                     # mark ground points inside the corridor
+        cv2.polylines(frame, [pts], True, (255, 255, 0), 2)     # full corridor: yellow
+        ahead = ahead_corridor if ahead_corridor is not None else corridor
+        if ahead_corridor is not None:                          # shorter ahead-only
+            apts = _np.array(ahead_corridor.polygon(w, h), dtype=_np.int32)
+            cv2.polylines(frame, [apts], True, (0, 165, 255), 1)   # ahead: orange, thin
+        for d in dets:                     # mark ground points by corridor relation
             gx, gy = int(d["cx"]), int(d["box"][3])
-            if corridor.contains(d["cx"], d["box"][3], w, h):
-                cv2.circle(frame, (gx, gy), 5, (0, 255, 255), -1)
+            if ahead.contains(d["cx"], d["box"][3], w, h):
+                cv2.circle(frame, (gx, gy), 5, (0, 255, 255), -1)   # ahead obstacle
+            elif not corridor.contains(d["cx"], d["box"][3], w, h):
+                half = corridor.half_width_at(d["box"][3], w, h)   # side-band (B5):
+                if half is not None and \
+                        abs(d["cx"] - w / 2.0) <= half + SIDE_BAND_FRAC * w:
+                    cv2.circle(frame, (gx, gy), 5, (255, 0, 255), -1)  # "on your L/R"
 
     # free-space (monocular-depth) verdict readout, top-right
     if freespace is not None and getattr(freespace, "available", False):
@@ -346,7 +418,7 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
         for (x1, y1, x2, y2) in crosswalk.lines:
             cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
         if crosswalk.found:
-            cv2.putText(frame, "crosswalk ahead", (10, 34),
+            cv2.putText(frame, "zebra crossing ahead", (10, 34),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2,
                         cv2.LINE_AA)
 
@@ -364,7 +436,7 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
             color = light_colors[light]  # colour the box by lamp state
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         tid = "" if d["id"] is None else f"#{d['id']} "
-        tag = " APPROACHING" if alerting else ""
+        tag = " CLOSING" if alerting else ""
         ltag = f" [{light}]" if light in light_colors else ""
         label = f"{tid}{d['name']} {d['conf']:.2f} {d['zone']}{tag}{ltag}"
         cv2.putText(frame, label, (x1, max(y1 - 6, 12)),
@@ -412,7 +484,7 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
 
     With track=True (default) each frame runs ByteTrack (model.track,
     persist=True) so objects keep stable ids, and a CollisionMonitor turns
-    bbox growth into CRITICAL "approaching fast" warnings. Directional (NORMAL)
+    bbox growth into CRITICAL "closing on X" warnings. Directional (NORMAL)
     alerts fire in both modes. Crosswalk + traffic-light detection run when
     enabled.
 
@@ -448,6 +520,8 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
     light_monitor = TrafficLightMonitor() if traffic_light else None
     path_guide = PathGuide() if path else None
     corridor = Corridor() if guidance else None
+    # shorter corridor for the straight-ahead cue only (side/path use the full one)
+    ahead_corridor = corridor.ahead() if corridor is not None else None
     arbiter = GuidanceArbiter() if guidance else None
     freespace_mon = FreeSpaceMonitor() if freespace else None
     if freespace_mon is not None:
@@ -459,6 +533,8 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
     last_banner_t = float("-inf")
     last_cands = None           # candidates from the most recent real frame
     last_scene_t = float("-inf")  # wall-clock of that frame (for stall sustain)
+    clear_announced = False     # spoke "path is clear" for the current clear run?
+    last_beep_t = float("-inf")   # last on-track heartbeat beep (1 Hz metronome)
     try:
         while stop_event is None or not stop_event.is_set():
             if cap is not None:
@@ -543,27 +619,60 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
             # --- decide what to say ---
             if publish and arbiter is not None:
                 blocked = freespace_mon.blocked if freespace_mon is not None else False
+                # transition detect: is the straight-ahead path clear right now?
+                # (no in-ahead-corridor obstacle and no wall). Speak "path is clear"
+                # once per clear run; a beep heartbeat covers the steady clear
+                # state. announce stays pending (sticky) until the arbiter actually
+                # emits it, so a transition landing inside the min_gap isn't lost.
+                ahead_clear = not blocked and not any(
+                    d["cls"] != TRAFFIC_LIGHT_ID
+                    and ahead_corridor.contains(d["cx"], d["box"][3], width, h_)
+                    for d in dets)
+                if not ahead_clear:
+                    clear_announced = False           # arm for the next clear run
+                announce_clear = ahead_clear and not clear_announced
                 last_cands = _build_candidates(dets, corridor, width, h_, growths,
                                                xres if xpub else None, light_anns,
-                                               path_msgs, blocked=blocked)
+                                               path_msgs, blocked=blocked,
+                                               ahead_corridor=ahead_corridor,
+                                               announce_clear=announce_clear,
+                                               heartbeat=True)
                 last_scene_t = now
                 chosen = arbiter.select(last_cands, now)
                 if chosen is not None:
                     event_bus.publish(chosen.to_event())
                     last_banner, last_banner_t = chosen.message, now
+                    if chosen.key == "clear":     # the one-shot actually went out
+                        clear_announced = True
+
+                # Steady 1 Hz on-track beep while there is genuinely NOTHING to
+                # report — emitted directly (bypassing the arbiter's 2s beat) as a
+                # non-verbal heartbeat the consumer renders as a beep. The beep
+                # means "all clear", so it's suppressed whenever the arbiter has any
+                # real cue to speak (a left/right side object, crosswalk, path hint,
+                # ...) — those take priority; only the "path is clear"/blocked
+                # path_state filler doesn't count. This stops the beep from talking
+                # over (and falsely reassuring past) a side detection.
+                has_cue = any(c.type != "path_state" for c in last_cands)
+                if (ahead_clear and not has_cue
+                        and (now - last_beep_t) >= ON_TRACK_BEEP_GAP):
+                    event_bus.publish(Event(
+                        message="", priority=Priority.LOW, type="heartbeat",
+                        source="vision", data={"beep": True}))
+                    last_beep_t = now
             elif publish:                    # legacy flood (--no-guidance), for A/B
                 announce_directional(dets, publish=True, debounce=debounce)
                 for idv, g in growths.items():
                     d = next((x for x in dets if x["id"] == idv), None)
                     if d is not None:
                         event_bus.publish(Event(
-                            message=f"{d['name']} approaching fast",
+                            message=collision_phrase(d["name"], d["zone"]),
                             priority=Priority.CRITICAL, type="collision",
                             source="vision", data={"class": d["name"], "id": idv,
                                                    "growth_per_sec": round(g, 2)}))
                 if xpub:
                     event_bus.publish(Event(
-                        message="crosswalk ahead", priority=Priority.NORMAL,
+                        message="zebra crossing ahead", priority=Priority.NORMAL,
                         type="crosswalk", source="vision",
                         data={"n_bands": xres.n_bands}))
                 for st, idv in light_anns:
@@ -586,7 +695,7 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 vis = frame.copy()
                 draw_overlay(vis, dets, alert_ids, crosswalk=xres,
                              path=path_info, corridor=corridor, banner=banner,
-                             freespace=freespace_mon)
+                             freespace=freespace_mon, ahead_corridor=ahead_corridor)
                 if on_annotated is not None:
                     on_annotated(vis)
                 if save is not None:
@@ -643,7 +752,7 @@ def run_on_image(path: str, *, publish: bool = True, show: bool = False,
               f"(bands={xres.n_bands}, lines={len(xres.lines)})")
         if xres.found and publish:
             event_bus.publish(Event(
-                message="crosswalk ahead", priority=Priority.NORMAL,
+                message="zebra crossing ahead", priority=Priority.NORMAL,
                 type="crosswalk", source="vision",
                 data={"n_bands": xres.n_bands}))
     if show:

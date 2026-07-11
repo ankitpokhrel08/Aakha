@@ -12,7 +12,7 @@ side-by-side you can watch and hear:
 
 ...with the spoken guidance muxed in as narration audio (macOS `say`), so at every
 moment you see the boxes, see the wall verdict, and HEAR exactly what the user
-would hear ("path blocked", "person ahead", "car approaching fast", ...).
+would hear ("path blocked", "person ahead", "closing on car", ...).
 
 Depth is the expensive stage (~350 ms/frame vs ~45 ms for everything else), so —
 exactly like the live background monitor — we run it every DEPTH_STRIDE-th frame
@@ -90,6 +90,7 @@ def _process(source: str, video_out: str, model: YOLO, est: DepthEstimator,
     depth = None                           # last computed depth map (held between samples)
     last_depth_t = -1e9
     last_banner, last_banner_t = "", -1e9
+    last_beep_t = -1e9                      # 1 Hz on-track beep while path is clear
     events: list[tuple[float, str, str]] = []
     writer = None
     read = 0                               # frames read from the video
@@ -153,6 +154,17 @@ def _process(source: str, video_out: str, model: YOLO, est: DepthEstimator,
         if chosen is not None:
             events.append((now, chosen.priority.name, chosen.message))
             last_banner, last_banner_t = chosen.message, now
+
+        # 1 Hz on-track beep while the straight-ahead path is clear (no in-corridor
+        # obstacle, no wall) — mirrors the live app's heartbeat so the validation
+        # video sounds like it. Baked into the narration via BEEP_MARKER.
+        in_ahead = any(d["cls"] != TRAFFIC_LIGHT_ID
+                       and corridor.contains(d["cx"], d["box"][3], w, h)
+                       for d in dets)
+        if (not blocked and not in_ahead) and (now - last_beep_t) >= 1.0:
+            events.append((now, "LOW", narr.BEEP_MARKER))
+            last_beep_t = now
+
         banner = last_banner if (now - last_banner_t) < 2.0 else ""
 
         vis = frame.copy()
