@@ -9,6 +9,7 @@ __pycache__/
 venv/
 env/
 myenv/
+env_aakha/
 
 # Secrets
 .env
@@ -31,10 +32,11 @@ models/
 # Platform tools and guide
 CLAUDE.md
 Context.txt
+ISSUES.md
 PROGRESS.md
-.venv/
 
-assets/annotated.mp4
-assets/cars.mp4
+# Generated demo media (large; regenerate with tools/render_narrated.py)
+assets
+
 # Vosk model zip and extracted folder
 vosk-model-*
