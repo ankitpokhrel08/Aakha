@@ -1,14 +1,23 @@
-"""Tier 3 — On-demand OCR via Tesseract, triggered by a keypress.
+"""Tier 3 — On-demand OCR via Apple's Vision framework (ocrmac), by keypress/voice.
 
-A background thread listens on stdin. When the user presses Enter (or any
-configured key), it grabs the latest frame, runs pytesseract, and publishes
-the extracted text as a LOW priority event.
+Migrated from Tesseract, then from PaddleOCR. Tesseract produced garbled output on
+real-world camera photos (dark backgrounds, coloured text, signs, badges) that TTS
+would read literally ("Ri q ricl I P A N T…"). PaddleOCR PP-OCRv4 read cleanly but
+`paddlepaddle==2.6.2` deadlocks in its C++ predictor on Apple Silicon (inference
+never returns) — see ocr_migration.md.
 
-Public API:
+Apple's Vision framework is native to Apple Silicon (the laptop backend always runs
+on the Mac; the phone only streams frames), needs no model download, and reads such
+images cleanly at ~40 ms warm. We reach it through the tiny `ocrmac` wrapper, whose
+only non-stdlib dep is pyobjc-framework-Vision (already installed).
+
+A background thread listens on stdin. When the user presses Enter it grabs the
+latest frame, runs OCR, and publishes the extracted text as a LOW priority event.
+
+Public API (unchanged, so main.py / voice_trigger need no edits):
     start_ocr_thread(get_frame) -> threading.Thread
-        get_frame: Callable[[], np.ndarray | None]
-            Same contract as scene_caption — returns the latest BGR frame or
-            None. Provided by main.py via get_latest_frame().
+        get_frame: Callable[[], np.ndarray | None] — latest BGR frame or None.
+    _run_ocr(frame) -> str — read text from a BGR frame (used by voice "read this").
 """
 from __future__ import annotations
 
@@ -23,40 +32,82 @@ from typing import Callable, Optional
 
 import cv2
 import numpy as np
-import pytesseract
+from PIL import Image
 
 from shared.bus import event_bus
 from shared.events import Event, Priority
 
-# PSM 11: sparse text — no layout analysis, finds text anywhere in the frame.
-# Correct for camera frames with signs/labels rather than full-page documents.
-_TESS_CONFIG = "--oem 1 --psm 11"
+# The "accurate" Vision backend. "vision" returns clean line-level results with real
+# per-line confidence; "livetext" is slower and fragments text into single tokens.
+_FRAMEWORK = "vision"
+# Vision's predictor isn't guaranteed thread-safe and OCR calls are rare +
+# user-triggered, so serialise inference with a cheap lock.
+_infer_lock = threading.Lock()
+# Confidence floor: drop low-confidence logo/background fragments while keeping
+# real text. Vision reports 0..1 per line on the "vision" backend.
+_MIN_CONF = 0.4
+
+# Resolved lazily: the ocrmac.OCR callable, or None if ocrmac/Vision is unavailable
+# (e.g. non-macOS). None means "no OCR" rather than a crashed thread.
+_ocr_cls = None
+_ocr_lock = threading.Lock()
+_ocr_probed = False
 
 
-def _preprocess(frame: np.ndarray) -> np.ndarray:
-    """Grayscale + Otsu threshold — boosts OCR accuracy on natural images.
+def _get_ocr():
+    """Return ocrmac's OCR class, or None if Vision/ocrmac isn't available.
 
-    Caps width at 1000px before processing; beyond that Tesseract slows down
-    without meaningful accuracy gains on camera-sourced text.
+    Resolves lazily on first call. Returns None (with a hint) instead of raising, so
+    a machine without ocrmac/Vision simply gets no OCR rather than a crashed thread.
     """
-    h, w = frame.shape[:2]
-    if w > 800:
-        scale = 1000 / w
-        frame = cv2.resize(frame, (800, int(h * scale)), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    return binary
+    global _ocr_cls, _ocr_probed
+    if _ocr_probed:
+        return _ocr_cls
+    with _ocr_lock:
+        if not _ocr_probed:
+            try:
+                from ocrmac import ocrmac
+                _ocr_cls = ocrmac.OCR
+            except Exception as exc:
+                print(f"[ocr] Apple Vision OCR unavailable ({exc}); OCR disabled. "
+                      f"On macOS install with: pip install ocrmac")
+                _ocr_cls = None
+            _ocr_probed = True
+    return _ocr_cls
 
 
 def _run_ocr(frame: np.ndarray) -> str:
-    """Run Tesseract on a BGR frame; return stripped text or empty string."""
-    processed = _preprocess(frame)
-    text = pytesseract.image_to_string(processed, config=_TESS_CONFIG)
-    return text.strip()
+    """Run Apple Vision OCR on a BGR frame; return the read text (stripped) or "".
+
+    Passes the frame straight through as a PIL image (no temp file needed). Lines are
+    returned top-to-bottom, left-to-right so the text reads in natural order.
+    """
+    ocr_cls = _get_ocr()
+    if ocr_cls is None or frame is None:
+        return ""
+    try:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        with _infer_lock:
+            annotations = ocr_cls(pil, framework=_FRAMEWORK).recognize()
+    except Exception as exc:
+        print(f"[ocr] inference failed: {exc}")
+        return ""
+    if not annotations:
+        return ""
+    # Each annotation is (text, confidence, [x, y, w, h]) with normalised, bottom-left
+    # origin coords — higher y is higher up the image. Sort top-to-bottom then
+    # left-to-right so multi-line signs read in the order a person would read them.
+    kept = [(t, box) for (t, conf, box) in annotations if conf >= _MIN_CONF and t.strip()]
+    kept.sort(key=lambda tb: (-round(tb[1][1], 2), tb[1][0]))
+    return " ".join(t.strip() for (t, _) in kept).strip()
 
 
 def _ocr_thread(get_frame: Callable[[], Optional[np.ndarray]]) -> None:
     """Block on stdin; on each Enter press, OCR the latest frame and publish."""
+    # Warm the engine at thread start so the first "read this" isn't a cold start.
+    _get_ocr()
+
     if not sys.stdin.isatty():
         # Non-interactive context (smoke test, pipe) — idle silently.
         # Keypress triggering only makes sense when a human is at the terminal.
@@ -120,10 +171,10 @@ def start_ocr_thread(
 
 
 if __name__ == "__main__":
-    """Standalone test: OCR a provided image file and confirm timing <500ms.
+    """Standalone test: OCR a provided image file and confirm warm timing <500ms.
 
     Usage:
-        TEST_IMAGE=/path/to/image.jpg env_aakha/bin/python visuals/ocr.py
+        TEST_IMAGE=/path/to/image.jpg .venv/bin/python visuals/ocr.py
     """
     from audio.consumer import start_consumer
 
@@ -142,7 +193,11 @@ if __name__ == "__main__":
     print("[test] Starting TTS consumer...")
     start_consumer()
 
-    # Run OCR directly (bypassing keypress) and time it.
+    # Warm the engine first so we time WARM inference (not the one-time load).
+    print("[test] Loading Apple Vision OCR (one-time)...")
+    _get_ocr()
+    _run_ocr(frame)
+
     print("[test] Running OCR...")
     t0 = time.time()
     text = _run_ocr(frame)

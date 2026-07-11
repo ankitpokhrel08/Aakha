@@ -1,87 +1,102 @@
-# Aakha — real-time assistive navigation for blind / low-vision users
+# Aakha
 
-A camera feed is analyzed on-device (classic CV + small models, **no LLM in the
-safety loop**) and turned into calm spoken guidance — "car on your left",
-"closing on person", a soft on-track beep while the path ahead is clear.
+Real-time assistive navigation for blind / low-vision users. No LLM in the safety
+loop: classic CV plus small models turn a camera feed into spoken guidance ("car on
+your left", "closing on person") and a soft beep while the path ahead is clear.
 
-The phone is the camera + speaker; a laptop runs the pipeline. The phone reaches
-it over a Cloudflare HTTPS tunnel (needed for camera/mic access in the browser).
+Phone is the camera and speaker. Laptop runs the pipeline. Phone connects over a
+Cloudflare HTTPS tunnel (browsers require HTTPS for camera/mic).
 
----
+macOS on Apple Silicon, Python 3.12.
 
-## 1. Prerequisites (one-time, system)
+## Setup
 
-macOS with [Homebrew](https://brew.sh):
+System deps (Homebrew):
 
 ```bash
-brew install tesseract ffmpeg cloudflared
+brew install ffmpeg cloudflared
 ```
 
-- **tesseract** — OCR ("read this")
-- **ffmpeg** — audio muxing for the offline demo videos
-- **cloudflared** — public HTTPS tunnel so the phone can use the camera/mic
-- `afplay` and `say` are built into macOS (beep playback + narration)
+`afplay` and `say` are built into macOS (beep + TTS). OCR uses Apple's Vision
+framework through the `ocrmac` pip package, so no OCR binary or model download.
 
-## 2. Setup (one-time, project)
+Project:
 
 ```bash
-# from the repo root
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-**Models** — YOLO11n (`yolo11n.onnx`) and depth (`depth_anything_v2_vits.onnx`)
-are already in the repo. Download the Vosk speech model (~40 MB) for voice
-commands:
+Models: `yolo11n.onnx` and `depth_anything_v2_vits.onnx` are checked in. The Vosk
+speech model (~40 MB, for voice commands) is not:
 
 ```bash
 curl -L -o /tmp/vosk.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
-unzip -q /tmp/vosk.zip -d .    # -> ./vosk-model-small-en-us-0.15/
+unzip -q /tmp/vosk.zip -d .   # -> ./vosk-model-small-en-us-0.15/
 ```
 
-> Moondream2 (Tier 2 scene captioning) downloads itself on first run. It is
-> optional — the core safety loop runs without it, and it idles gracefully if it
-> can't load.
+Moondream2 (Tier 2 scene captioning) downloads itself on first run. It is optional;
+the core loop runs without it and idles if it can't load.
 
-## 3. Run the whole app (phone + laptop)
+## Run
 
-**Terminal 1 — the pipeline + web server** (all worker threads: vision, audio,
-voice, OCR):
+Two terminals. Pipeline + web server:
 
 ```bash
-.venv/bin/python server.py
+.venv/bin/python server.py     # http://0.0.0.0:8000
 ```
 
-Serves on `http://0.0.0.0:8000`.
-
-**Terminal 2 — the public HTTPS tunnel** for your phone:
+HTTPS tunnel for the phone:
 
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
 
-It prints a URL like `https://<random>.trycloudflare.com` — **open that on your
-phone** (Safari on iOS, Chrome on Android). The URL is new on every restart.
+This prints a `https://<random>.trycloudflare.com` URL (new on every restart). Open
+it on the phone: Safari on iOS, Chrome on Android.
 
-**On the phone:** tap the big toggle button once (starts navigation *and*
-unlocks audio — iOS needs that first tap for the beep/TTS), then grant camera +
-mic. Point it around: clear path → soft beep; object to the side → spoken
-direction; something ahead/looming → obstacle/collision cue. Say "read this" to
-hear OCR of text in view.
+## Phone UI
 
-## 4. Handy extras
+The whole screen is one button.
 
-| What | Command / URL |
+1. Tap to start. First tap starts navigation and unlocks audio (iOS needs a tap
+   before it will play beep/TTS). Grant camera + mic. Says "Navigation", then
+   guides: clear path beeps, side object gives a direction, something ahead or
+   looming gives an obstacle/collision cue.
+2. Hold to speak a command. Says "Recording started", you speak (see below),
+   release. Says "Processing", then speaks the answer.
+3. Stays paused after a command so the answer isn't cut off. Camera keeps
+   streaming.
+4. Tap to resume navigation. Tapping again while navigating pauses it.
+
+## Voice commands
+
+Hold, speak, release. Matching tolerates phrasing and Vosk mis-hearings, so any of
+the examples (and close variants) work.
+
+| Command | Action | Examples |
+|---|---|---|
+| Read | OCR the current frame aloud | "read this", "read the text", "what does this say" |
+| What am I holding | Names the object held up to the camera | "what am I holding", "what's in my hand", "what is this object" |
+| Describe the scene | Moondream2 caption, if loaded | "describe the scene", "what's around me", "what's in front", "look around" |
+| Repeat | Re-speaks the last line | "repeat that", "say again", "one more time" |
+
+Heard nothing: "I didn't catch that". Heard speech but no known command: reads back
+the command list. Either way it returns to paused; tap to resume.
+
+## Extras
+
+| What | How |
 |---|---|
-| Live detection overlay (laptop) | open `http://localhost:8000/monitor` while the phone streams |
-| Event / thread dashboard | open `http://localhost:8000/dashboard` |
-| Run on the laptop webcam (no phone) | `.venv/bin/python main.py` |
-| Run against a video file | `VISION_SOURCE=path/to/clip.mp4 .venv/bin/python main.py` |
+| Live detection overlay | `http://localhost:8000/monitor` while the phone streams |
+| Event / thread dashboard | `http://localhost:8000/dashboard` |
+| Laptop webcam, no phone | `.venv/bin/python main.py` |
+| Video file instead of camera | `VISION_SOURCE=path/to/clip.mp4 .venv/bin/python main.py` |
 | Smoke test (merge gate) | `.venv/bin/python shared/smoke_test.py` |
 
-## 5. Stopping
+## Stop
 
-`Ctrl-C` in each terminal. If a server is orphaned on the port:
+`Ctrl-C` in each terminal. If the port is stuck:
 
 ```bash
 lsof -ti:8000 | xargs kill -9

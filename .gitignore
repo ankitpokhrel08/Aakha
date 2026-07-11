@@ -30,6 +30,7 @@ CLAUDE.md
 Context.txt
 ISSUES.md
 PROGRESS.md
+ocr_migration.md
 
 # Generated demo media (large; regenerate with tools/render_narrated.py)
 assets

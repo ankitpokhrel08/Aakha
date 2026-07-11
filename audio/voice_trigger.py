@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,15 +63,52 @@ _DEFAULT_MODEL_PATH = os.path.join(
 )
 
 # ---------------------------------------------------------------------------
-# Keyword matching — keep vocabulary small for outdoor STT accuracy.
-# Each entry: (keywords_that_must_appear, command_key)
-# First match wins; order matters.
+# Command matching. The Vosk small model mis-hears single keywords a lot, and
+# people phrase the same intent many ways, so instead of one exact word we match
+# a SET of regex patterns per command — word STEMS (\bhold catches hold/holding/
+# holds), synonyms, and whole natural phrases. If ANY pattern is found anywhere in
+# the transcript the command fires. First command with a hit wins, so the broadest
+# one (describe) is checked LAST to avoid it hijacking a more specific intent.
+# It's just re.search on a short string — microseconds, well within real-time.
 # ---------------------------------------------------------------------------
-_COMMANDS = [
-    ({"holding"},                     "holding"),
-    ({"read"},                        "read"),
-    ({"describe"},                    "describe"),
-    ({"repeat"},                      "repeat"),
+_COMMAND_PATTERNS = [
+    ("holding", [
+        r"\bhold",                      # hold, holding, holds
+        r"\bcarry",                     # carry, carrying
+        r"in (my|the|your) hand",       # "what's in my hand"
+        r"\bhand(s)?\b",
+        r"what.*this (object|thing|item)",
+        r"what('s| is) this thing",
+    ]),
+    ("read", [
+        r"\bread",                      # read, reading, reads
+        r"what does (it|this|that|the).* say",
+        r"what('s| is) (it|this|that) say",
+        r"\btext\b",
+        r"\bwritten\b",
+    ]),
+    ("repeat", [
+        r"\brepeat",                    # repeat, repeated, repeating
+        r"(say|come) again",
+        r"\bagain\b",
+        r"what did you say",
+        r"one more time",
+        r"\bpardon\b",
+    ]),
+    ("describe", [                       # broadest — checked last
+        r"\bdescrib",                   # describe, describing, description
+        r"\bscene\b",
+        r"\bsurrounding",
+        r"around me",
+        r"what.*(around|in front|ahead|is there)",
+        r"(what|tell).*(you see|do you see)",
+        r"\blook around",
+    ]),
+]
+
+# Compile once at import (patterns never change) — matching is then just search.
+_COMPILED_COMMANDS = [
+    (key, [re.compile(p) for p in pats]) for key, pats in _COMMAND_PATTERNS
 ]
 
 
@@ -112,10 +150,16 @@ def transcribe_clip(audio_bytes: bytes, model=None) -> str:
 
 
 def _match_command(transcript: str) -> Optional[str]:
-    """Return the command key for the first keyword set that matches."""
-    words = set(transcript.lower().split())
-    for keywords, key in _COMMANDS:
-        if keywords.issubset(words):
+    """Return the command key whose patterns first match the transcript, or None.
+
+    Robust to Vosk mis-hearings and phrasing: any one matching pattern fires the
+    command (see _COMMAND_PATTERNS). Broadest command checked last.
+    """
+    t = transcript.lower().strip()
+    if not t:
+        return None
+    for key, patterns in _COMPILED_COMMANDS:
+        if any(p.search(t) for p in patterns):
             return key
     return None
 

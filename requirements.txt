@@ -5,8 +5,9 @@
 #   source .venv/bin/activate
 #   pip install -r requirements.txt
 #
-# NOTE: pytesseract is only a wrapper — it needs the Tesseract binary on the
-# system:  brew install tesseract   (already present on the dev machine).
+# NOTE: OCR uses Apple's Vision framework via `ocrmac` (macOS-only, native to
+# Apple Silicon). No system binary or model download needed. The backend always
+# runs on the Mac, so a macOS-native OCR engine is fine.
 
 # --- core ---
 numpy==2.5.1
@@ -38,6 +39,8 @@ einops==0.8.2                  # required by the Moondream2 model code
 #                                Re-enable only after resolving the pillow constraint.
 
 # --- Tier 3: OCR + voice trigger ("what am I holding") ---
-pytesseract==0.3.13          # wrapper over the system `tesseract` binary
+ocrmac==1.0.1                # Apple Vision OCR wrapper (pulls pyobjc-framework-Vision).
+#                              Replaces Tesseract (garbled output) and PaddleOCR
+#                              (paddlepaddle 2.6.2 deadlocks on Apple Silicon).
 vosk==0.3.44                 # offline wake/command speech recognition
 mediapipe==0.10.35           # hand landmarks to locate the held object
