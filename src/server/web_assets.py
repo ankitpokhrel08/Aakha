@@ -1,9 +1,6 @@
-"""Static web assets for the PWA, served inline by server.py.
-
-Kept as strings/bytes (not a static dir) so `import server` stays filesystem-
-coupling-free and the tunnel/HTTPS setup doesn't depend on a static mount.
-Contains: the web manifest, a minimal service worker, the AudioWorklet PCM
-downsampler (mic -> 16 kHz mono PCM16 for Vosk), and a generated app icon.
+"""Static PWA assets served inline by server.py (kept as strings/bytes, not a
+static dir): the manifest, service worker, AudioWorklet PCM downsampler (mic ->
+16 kHz mono PCM16 for Vosk), and a generated app icon.
 """
 from __future__ import annotations
 
@@ -29,9 +26,7 @@ MANIFEST = json.dumps({
 }, indent=2)
 
 
-# Minimal service worker: precache the shell, network-first for everything (so
-# fresh events/pages always win), fall back to cache/'/' offline. WebSocket
-# traffic is never intercepted.
+# Service worker: precache the shell, network-first, fall back to cache offline.
 SERVICE_WORKER_JS = """
 const CACHE = 'aakha-v1';
 self.addEventListener('install', (e) => {
@@ -50,9 +45,7 @@ self.addEventListener('fetch', (e) => {
 """
 
 
-# AudioWorklet processor: resample the mic (context rate, e.g. 48 kHz) down to
-# 16 kHz mono, convert Float32 -> Int16, and post raw PCM chunks to the main
-# thread. Loaded via audioWorklet.addModule('/pcm-worklet.js').
+# AudioWorklet: resample the mic to 16 kHz mono, Float32 -> Int16, post PCM chunks.
 PCM_WORKLET_JS = """
 class PCM16Downsampler extends AudioWorkletProcessor {
   constructor() { super(); this.targetRate = 16000; this._pos = 0; }

@@ -1,12 +1,8 @@
-"""Tier 1 traffic-light state — HSV colour threshold, no ML.
+"""Traffic-light state — HSV colour threshold on YOLO's traffic-light box.
 
-YOLO already gives us the "traffic light" box (COCO class 9). We crop it,
-convert to HSV, and count bright, saturated pixels falling in the red / amber /
-green hue ranges — the lit lamp dominates. Whichever colour wins is the state.
-Costs ~nothing; it's a threshold on a box we already have.
-
-A short per-light persistence + cooldown (TrafficLightMonitor) avoids
-announcing every flickery frame and re-announcing an unchanged state.
+Crop the box (COCO class 9), count bright saturated pixels in the red/amber/green
+hue bands, and take the winner. TrafficLightMonitor adds persistence + cooldown
+so a flickery frame or an unchanged state isn't (re-)announced.
 """
 from __future__ import annotations
 

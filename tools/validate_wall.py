@@ -1,28 +1,11 @@
 """End-to-end validation video: object + audio + wall detection on real footage.
 
-Runs the REAL Tier-1 pipeline (same YOLO detections, same collision monitor, same
-guidance arbiter, same monocular-depth wall metric) over a clip and renders a
-side-by-side you can watch and hear:
-
-    [ annotated frame ]                         [ depth heat-map ]
-      YOLO boxes + tracks                         red = near, blue = far
-      walking corridor                            NEAR / AHEAD sample bands
-      WALL / free readout (top-right)
-      spoken-caption banner (bottom)
-
-...with the spoken guidance muxed in as narration audio (macOS `say`), so at every
-moment you see the boxes, see the wall verdict, and HEAR exactly what the user
-would hear ("path blocked", "person ahead", "closing on car", ...).
-
-Depth is the expensive stage (~350 ms/frame vs ~45 ms for everything else), so —
-exactly like the live background monitor — we run it every DEPTH_STRIDE-th frame
-(~5 fps) and hold the verdict between samples, instead of every frame. The rest of
-the pipeline (YOLO, arbiter) still runs on every frame on video-time, so the
-narration lines up with the picture. This is a validation artifact, not the
-real-time path.
-
-Outputs one <clip>_validated.mp4 per clip into a single root folder (default
-wall_validated/).
+Runs the real pipeline (YOLO, collision, guidance arbiter, depth wall metric)
+over a clip and renders a side-by-side [annotated frame | depth heat-map] with
+the spoken guidance muxed in as narration (macOS `say`), so you see the boxes and
+wall verdict and hear exactly what the user would. Depth is sampled on a
+video-time cadence (it's the expensive stage) and held between samples; this is a
+validation artifact, not the real-time path.
 
 Usage (from the repo root):
     .venv/bin/python tools/validate_wall.py                    # all assets/wall/*
@@ -48,24 +31,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import render_narrated as narr  # noqa: E402  (audio synth/placement/mux helpers)
 from ultralytics import YOLO  # noqa: E402
 
-from vision.collision import CollisionMonitor  # noqa: E402
-from vision.crosswalk import CrosswalkDetector  # noqa: E402
-from vision.depth import (  # noqa: E402
+from src.vision.collision import CollisionMonitor  # noqa: E402
+from src.vision.crosswalk import CrosswalkDetector  # noqa: E402
+from src.vision.depth import (  # noqa: E402
     OFF_THRESHOLD, ON_THRESHOLD, TAU, DepthEstimator, near_fraction)
-from vision.detect import (  # noqa: E402
+from src.vision.detect import (  # noqa: E402
     CONF, IMG_SIZE, _build_candidates, detections_from, draw_overlay,
     ensure_onnx_model)
-from vision.guidance import Corridor, GuidanceArbiter  # noqa: E402
-from vision.path import PathGuide  # noqa: E402
-from vision.traffic_light import (  # noqa: E402
+from src.vision.guidance import Corridor, GuidanceArbiter  # noqa: E402
+from src.vision.path import PathGuide  # noqa: E402
+from src.vision.traffic_light import (  # noqa: E402
     TRAFFIC_LIGHT_ID, TrafficLightMonitor, classify_light)
 
 from depth_overlay import PANEL_H, depth_heatmap, draw_regions, fit  # noqa: E402
 
-# Speed knobs for the offline renderer (don't affect per-frame results, only the
-# output's temporal resolution): jump frames, and sample the expensive depth on a
-# video-time cadence rather than every frame (a wall is static, so ~2.5 Hz is
-# plenty). See the profile: depth ~358 ms dominates; YOLO ~43 ms.
+# Offline-render speed knobs (affect only temporal resolution): jump frames, and
+# sample the expensive depth on a video-time cadence (a wall is static).
 FRAME_STRIDE = 2         # process/write every Nth frame (output plays at fps/stride)
 DEPTH_PERIOD = 0.4       # min seconds of video-time between depth samples (~2.5 Hz)
 
@@ -120,8 +101,7 @@ def _process(source: str, video_out: str, model: YOLO, est: DepthEstimator,
                 growths[d["id"]] = g
                 alert_ids.add(d["id"])
 
-        # depth is expensive (~350 ms) -> sample on a video-time cadence
-        # (depth_period seconds) and hold the map + verdict between samples.
+        # sample depth on a video-time cadence; hold the map + verdict between samples
         if depth is None or (now - last_depth_t) >= depth_period:
             depth = est.infer(frame)
             # rate-independent smoothing on video-time dt (same TAU as the monitor)
@@ -155,9 +135,7 @@ def _process(source: str, video_out: str, model: YOLO, est: DepthEstimator,
             events.append((now, chosen.priority.name, chosen.message))
             last_banner, last_banner_t = chosen.message, now
 
-        # 1 Hz on-track beep while the straight-ahead path is clear (no in-corridor
-        # obstacle, no wall) — mirrors the live app's heartbeat so the validation
-        # video sounds like it. Baked into the narration via BEEP_MARKER.
+        # 1 Hz on-track beep while the path is clear (mirrors the live heartbeat)
         in_ahead = any(d["cls"] != TRAFFIC_LIGHT_ID
                        and corridor.contains(d["cx"], d["box"][3], w, h)
                        for d in dets)

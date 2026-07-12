@@ -1,32 +1,19 @@
-"""Tier 1 guidance — walking corridor + single-slot alert arbiter.
+"""Guidance — walking corridor + single-slot alert arbiter.
 
-Turns a flood of correct detections into a calm, in-path, prioritized voice,
-following the electronic-travel-aid consensus:
-
-  * Corridor: a trapezoid anchored at the bottom-centre of the frame (where the
-    user's next steps land). An object only matters if its GROUND CONTACT point
-    (bottom-centre of its box) falls inside the corridor — so a bus across the
-    road, whose feet are on the tarmac, is silently ignored.
-
-  * GuidanceArbiter: one speech slot. Every producer proposes Candidate alerts;
-    the arbiter emits at most one, ranked by priority then urgency (time-to-
-    collision / proximity), with a global rate limit + per-key repeat
-    suppression. CRITICAL (looming collision) preempts and has its own cooldown.
-
-This module is intentionally free of any bus/detection imports so it stays
-trivially testable; the caller builds Candidates and publishes the winner.
+Corridor: a trapezoid at the frame bottom; an object matters only if its ground
+contact (bbox bottom-centre) falls inside it, so a bus across the road is
+ignored. GuidanceArbiter: one speech slot; producers propose Candidates and it
+emits at most one, ranked by priority then urgency, with per-key repeat
+suppression. No bus/detection imports here, so it stays trivially testable.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from shared.events import Event, Priority
+from src.core.events import Event, Priority
 
-# The straight-ahead "X ahead" obstacle cue uses a SHORTER corridor than the side
-# (left/right) cues and path guidance: an in-path warning should only fire for
-# something genuinely near, while side/path detection keep a longer reach. This is
-# the far edge of that shorter ahead-only corridor (see Corridor.ahead()).
+# Far edge of the shorter ahead-only corridor (see Corridor.ahead()).
 AHEAD_TOP_FRAC = 0.63
 
 # Per-class danger weight — ranks which in-corridor obstacle to name first.
@@ -36,8 +23,7 @@ DANGER = {
 }
 DANGER_DEFAULT = 0.8
 
-# Classes we name in speech. Anything detected but NOT here is spoken as a
-# generic "object" — we don't guess uncertain labels (product decision).
+# Classes named in speech; anything else is spoken as a generic "object".
 SPEAK_BY_NAME = {"person", "bicycle", "motorcycle", "car", "bus", "truck",
                  "dog", "cat"}
 
@@ -51,23 +37,12 @@ def display_name(name: str) -> str:
 class Corridor:
     """Trapezoid over the walkable region ahead (fractions of frame size)."""
 
-    bottom_width_frac: float = 0.72   # half-open width at the very bottom
-    top_width_frac: float = 0.36      # width where the corridor starts (far)
+    bottom_width_frac: float = 0.72   # width at the very bottom (at your feet)
+    top_width_frac: float = 0.36      # width at the far edge
     top_frac: float = 0.52            # corridor begins at this fraction of height
-    #  top_frac lowered from the original 0.45 to shorten the over-long corridor
-    #    (far-off objects were treated as in-path; the ETA literature puts the
-    #    useful local-navigation zone at ~2-3 m ahead — preview beyond that only
-    #    slows walkers and adds noise, "The Cost of Knowing", ACM 2022). We first
-    #    tried 0.63 (a ~40% cut) but that clipped the near field too aggressively;
-    #    0.52 backs ~30% of that length off (0.37 -> 0.48 of frame height) for a
-    #    corridor that's shorter than the original yet still previews enough ground.
-    #  top_width_frac raised 0.20 -> 0.36: the old 0.20 taper was tuned for the
-    #    longer 0.45 corridor; on the shortened one it pinched the lane to a point
-    #    right where coverage is still needed. A shorter corridor spans less depth,
-    #    so it needs less perspective narrowing. 0.36 keeps a roughly constant
-    #    ~0.9-1.0 m walkable lane (ADA min clear width) from feet to far edge.
-    #  contains(), the polygon() overlay, and path.clearest_path() all read these
-    #    same fields, so they stay aligned automatically.
+    # Tuned to preview only the ~2-3 m local-navigation zone: a shorter, roughly
+    # constant ~1 m lane. contains(), polygon(), and path.clearest_path() all read
+    # these fields, so they stay aligned.
 
     def half_width_at(self, py: float, w: int, h: int) -> Optional[float]:
         """Half-width (px) of the corridor at image row py, or None if py is above
@@ -118,15 +93,10 @@ class Candidate:
 class GuidanceArbiter:
     """One speech slot with a steady cadence.
 
-    - CRITICAL fires immediately, throttled only per-track (critical_gap) so a
-      looming hazard is never delayed by the timer.
-    - NORMAL/LOW: at most one cue every `min_gap` seconds AND no single key more
-      often than its own Candidate.cooldown. The global gap keeps the voice calm;
-      the per-key cooldown stops any one message (a persistent "path is clear"
-      filler, a standing obstacle, a lingering crosswalk) from nagging on every
-      beat. When the best candidate is still cooling down we fall through to the
-      next eligible one, and if nothing is eligible we stay silent — silence
-      itself reads as "nothing new", which is calmer than repeating "path clear".
+    CRITICAL fires immediately, throttled only per-track (critical_gap).
+    NORMAL/LOW: at most one cue per `min_gap`, and no key more often than its own
+    Candidate.cooldown. If the best candidate is still cooling down we fall
+    through to the next eligible one; if none are, we stay silent.
     """
 
     def __init__(self, min_gap: float = 1.4, critical_gap: float = 1.5) -> None:

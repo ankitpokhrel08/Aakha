@@ -1,20 +1,14 @@
 """Render an annotated + narrated demo video from a source clip.
 
-Runs the real Tier 1 vision pipeline over a video, draws the overlay (boxes,
-tracks, crosswalk, traffic-light, collision highlights), records every event it
-publishes at that frame's timestamp, synthesizes speech for each with macOS
-``say``, lays the clips down on a timeline (CRITICAL collision warnings placed
-first so they're never dropped, then directional alerts fill the gaps without
-overlapping), and muxes the audio onto the video with ffmpeg.
-
-The result is a single MP4 you can watch to *see and hear* what the pipeline is
-doing — a validation / demo artifact.
+Runs the real pipeline over a video, draws the overlay, records every published
+event, synthesizes speech per event with macOS `say`, lays the clips on a
+timeline (CRITICAL first so warnings are never dropped, then the rest fill gaps
+without overlapping), and muxes the audio onto the video with ffmpeg.
 
 Usage (from the repo root):
     .venv/bin/python tools/render_narrated.py --source assets/cars.mp4 --open
-    .venv/bin/python tools/render_narrated.py --source clip.mp4 --output out.mp4
 
-Requirements: macOS ``say`` and ``ffmpeg`` on PATH (both checked at startup).
+Requires macOS `say` and `ffmpeg` on PATH (both checked at startup).
 """
 from __future__ import annotations
 
@@ -29,31 +23,28 @@ from pathlib import Path
 
 import numpy as np
 
-# repo root on path so `vision` / `shared` import regardless of cwd
+# repo root on path so `src` imports regardless of cwd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2  # noqa: E402
 
-from shared.bus import event_bus  # noqa: E402
-from vision import detect  # noqa: E402
+from src.core.bus import event_bus  # noqa: E402
+from src.vision import detect  # noqa: E402
 
 SR = 22050          # narration sample rate (mono 16-bit)
 SAY_RATE = 190      # words per minute for `say`
 CLIP_GAP = 0.12     # min silence between spoken clips (s)
 PRIORITY_RANK = {"CRITICAL": 0, "NORMAL": 1, "LOW": 2}
 
-# On-track heartbeat beep: vision publishes empty-message type="heartbeat" events
-# (~1 Hz while the path is clear). We bake the actual Purr.mp3 into the narration
-# track at those timestamps so the demo video *sounds* like the live app. Callers
-# tag such events with BEEP_MARKER as the "message" so _synthesize returns the beep
-# clip instead of speech.
+# Bake Purr.mp3 into the narration at type="heartbeat" timestamps so the demo
+# sounds like the live app. Events tagged with BEEP_MARKER return the beep clip.
 BEEP_MARKER = "\x00on-track-beep"
 _BEEP_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "sound_asset", "Purr.mp3")
+                         "sounds", "Purr.mp3")
 
 
 def _load_beep() -> np.ndarray:
-    """Decode the on-track beep (sound_asset/Purr.mp3) to SR mono int16, cached
+    """Decode the on-track beep (sounds/Purr.mp3) to SR mono int16, cached
     (reuses _SYNTH_CACHE keyed by BEEP_MARKER). Silent 1-sample clip on failure."""
     if BEEP_MARKER in _SYNTH_CACHE:
         return _SYNTH_CACHE[BEEP_MARKER]
@@ -86,13 +77,8 @@ _SYNTH_CACHE: dict[str, np.ndarray] = {}
 
 
 def _synthesize(message: str, path: str) -> np.ndarray:
-    """Render `message` to 22.05kHz mono int16 via `say`, cached per phrase.
-
-    The guidance vocabulary is tiny and highly repetitive ("path is clear",
-    "path blocked", ...), so each distinct phrase is synthesized once and reused
-    — instead of one `say` per event (hundreds of calls). `say` is also bounded
-    by a timeout so a single wedged call can't hang the whole render.
-    """
+    """Render `message` to 22.05kHz mono int16 via `say`, cached per phrase (the
+    vocabulary is tiny and repetitive). `say` is timeout-bounded so it can't hang."""
     if message == BEEP_MARKER:            # the on-track beep, not speech
         return _load_beep()
     if message in _SYNTH_CACHE:

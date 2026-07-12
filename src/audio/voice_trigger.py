@@ -1,36 +1,13 @@
-"""Tier 3 — One-shot Vosk transcription + 3-command keyword dispatch.
+"""One-shot Vosk transcription + 3-command keyword dispatch.
 
-Updated scope (per PROGRESS.md):
-  Wake-word continuous listening is CUT. Instead, Dev 3 sends a short WAV
-  clip over WiFi when the user presses the volume button on their phone.
-  This module receives that clip (as raw bytes or a file path), runs Vosk
-  on it, matches against 3 fixed phrases, and dispatches the right action.
+The server drops a short PCM clip onto `clip_queue` when the user holds to talk;
+this thread transcribes it and dispatches one of three commands:
+  "what am I holding"  -> most prominent object over a ~2 s scan
+  "read this"          -> OCR the current frame
+  "repeat that"        -> re-speak the last TTS message (type="repeat")
 
-The 3 commands and their actions:
-  "what am I holding"  → most prominent object over a ~2 s scan → publish
-  "read this"          → trigger OCR on current frame → publish
-  "repeat that"        → re-speak last TTS message → publish type="repeat"
-
-Public API:
-    transcribe_clip(audio_bytes: bytes) -> str
-        Run Vosk on raw 16kHz mono PCM bytes; return transcribed text.
-
-    dispatch_command(transcript: str, get_frame, get_detections=None) -> None
-        Match transcript to the 3 commands and publish the right Event(s).
-
-    start_voice_trigger_thread(get_frame, get_detections=None) -> threading.Thread
-        Background thread that monitors a shared clip queue. Dev 3 drops
-        audio clips into `clip_queue`; this thread processes them.
-
-    clip_queue: queue.Queue
-        Put raw 16kHz mono PCM bytes here to trigger transcription.
-        Dev 3's WiFi transport should put received clips here directly.
-
-Environment:
-    VOSK_MODEL_PATH — path to a downloaded Vosk model directory.
-                      Default: <repo_root>/vosk-model-small-en-us-0.15
-                      Download: https://alphacephei.com/vosk/models
-                        → vosk-model-small-en-us-0.15.zip (~40 MB)
+VOSK_MODEL_PATH overrides the model dir (default: <repo_root>/
+vosk-model-small-en-us-0.15, ~40 MB from https://alphacephei.com/vosk/models).
 """
 from __future__ import annotations
 
@@ -39,7 +16,7 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import queue
 import threading
@@ -48,45 +25,38 @@ from typing import Callable, List, Optional
 
 import numpy as np
 
-from shared.bus import event_bus
-from shared.events import Event, Priority
+from src.core.bus import event_bus
+from src.core.events import Event, Priority
 
-# ---------------------------------------------------------------------------
-# Public clip queue — Dev 3 puts raw 16kHz mono PCM bytes here.
-# ---------------------------------------------------------------------------
+# Public clip queue: the server puts raw 16kHz mono PCM bytes here.
 clip_queue: queue.Queue = queue.Queue()
 
 _DEFAULT_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "vosk-model-small-en-us-0.15",
 )
 
-# ---------------------------------------------------------------------------
-# Command matching. The Vosk small model mis-hears single keywords a lot, and
-# people phrase the same intent many ways, so instead of one exact word we match
-# a SET of regex patterns per command — word STEMS (\bhold catches hold/holding/
-# holds), synonyms, and whole natural phrases. If ANY pattern is found anywhere in
-# the transcript the command fires. First command with a hit wins.
-# It's just re.search on a short string — microseconds, well within real-time.
-# ---------------------------------------------------------------------------
+# Command matching: a set of regex patterns per command (stems, synonyms, whole
+# phrases) to tolerate Vosk mis-hearings and varied phrasing. Any pattern hit
+# fires the command; first command with a hit wins.
 _COMMAND_PATTERNS = [
     ("holding", [
-        r"\bhold",                      # hold, holding, holds
-        r"\bcarry",                     # carry, carrying
-        r"in (my|the|your) hand",       # "what's in my hand"
+        r"\bhold",
+        r"\bcarry",
+        r"in (my|the|your) hand",
         r"\bhand(s)?\b",
         r"what.*this (object|thing|item)",
         r"what('s| is) this thing",
     ]),
     ("read", [
-        r"\bread",                      # read, reading, reads
+        r"\bread",
         r"what does (it|this|that|the).* say",
         r"what('s| is) (it|this|that) say",
         r"\btext\b",
         r"\bwritten\b",
     ]),
     ("repeat", [
-        r"\brepeat",                    # repeat, repeated, repeating
+        r"\brepeat",
         r"(say|come) again",
         r"\bagain\b",
         r"what did you say",
@@ -139,11 +109,7 @@ def transcribe_clip(audio_bytes: bytes, model=None) -> str:
 
 
 def _match_command(transcript: str) -> Optional[str]:
-    """Return the command key whose patterns first match the transcript, or None.
-
-    Robust to Vosk mis-hearings and phrasing: any one matching pattern fires the
-    command (see _COMMAND_PATTERNS).
-    """
+    """Return the command key whose patterns first match the transcript, or None."""
     t = transcript.lower().strip()
     if not t:
         return None
@@ -153,19 +119,12 @@ def _match_command(transcript: str) -> Optional[str]:
     return None
 
 
-# --- "what am I holding" — scan a short window, not one instant (V5) ----------
-# The old code sampled a SINGLE frame: if the hand happened to be missing (or the
-# object was between YOLO detections) in that exact frame, it wrongly answered
-# "I can't see your hand" even though the object was plainly visible. Hand
-# detection is dropped entirely — it was unreliable (kept failing to locate the
-# hand). Instead we assume the object held up to the camera is simply the most
-# PROMINENT one (closest => biggest box, and near the frame centre), scanned over
-# ~2 s and decided by majority vote so a single-frame miss can't flip the result.
+# "what am I holding": no hand detection (it was unreliable). The held object is
+# taken to be the most prominent one (biggest, most central), scanned over ~2 s
+# and majority-voted so a single-frame miss can't flip the result.
 _HOLD_SCAN_SECONDS = 2.0
-_HOLD_SAMPLE_GAP = 0.12     # ~8 samples/sec of the pushed stream
-# Classes that are never a "held object" — the user / bystanders, so a body in
-# view can't be reported as what he's holding.
-_NOT_HELD = {"person"}
+_HOLD_SAMPLE_GAP = 0.12     # ~8 samples/sec
+_NOT_HELD = {"person"}      # never reported as a held object
 
 
 def _prominence(det, w: int, h: int) -> float:
@@ -196,13 +155,7 @@ def _most_prominent(detections, w: int, h: int) -> Optional[str]:
 
 def _scan_held_object(get_frame, get_detections,
                       duration: float = _HOLD_SCAN_SECONDS) -> str:
-    """Decide what the user is holding by watching the live frame for ~`duration`
-    s and reporting the most prominent object over the window (V5).
-
-    No hand detection: the held object is taken to be the closest/most-central
-    thing in view, majority-voted across frames so a one-frame miss can't flip
-    the answer.
-    """
+    """Report the most prominent object over a ~`duration` s window, majority-voted."""
     from collections import Counter
 
     votes: "Counter[str]" = Counter()
@@ -227,19 +180,12 @@ def dispatch_command(
     get_frame: Callable[[], Optional[np.ndarray]],
     get_detections: Optional[Callable[[], Optional[List[dict]]]] = None,
 ) -> None:
-    """Match transcript → command → publish the appropriate Event(s).
-
-    This is pure dispatch logic with no I/O of its own; the background thread
-    calls it after transcription. Can also be called directly in tests.
-    """
+    """Match transcript -> command -> publish the appropriate Event(s)."""
     print(f"[voice_trigger] transcript: {transcript!r}")
     cmd = _match_command(transcript)
     if cmd is None:
-        # V4: distinguish "heard nothing" from "heard an unknown command".
-        #   - empty transcript -> the user held but said nothing intelligible;
-        #     just a brief cue (don't dump the whole command list every time).
-        #   - real speech, no match -> offer the list of available commands.
-        # Both are terminal replies, so navigation resumes once they finish.
+        # Distinguish "heard nothing" (brief cue) from "heard an unknown command"
+        # (offer the command list). Both are terminal, so navigation resumes after.
         if not transcript.strip():
             print("[voice_trigger] Nothing heard.")
             message = "I didn't catch that."
@@ -267,7 +213,6 @@ def dispatch_command(
         ))
 
     elif cmd == "read":
-        # Trigger OCR on the current frame inline (Tesseract is fast enough).
         frame = get_frame()
         if frame is None:
             event_bus.publish(Event(
@@ -277,7 +222,7 @@ def dispatch_command(
                 source="voice",
             ))
             return
-        from visuals.ocr import _run_ocr
+        from src.vision.ocr import _run_ocr
         text = _run_ocr(frame)
         message = f"Text reads: {text}" if text else "No text found in the frame."
         event_bus.publish(Event(
@@ -310,9 +255,7 @@ def dispatch_command(
         ))
 
 
-# ---------------------------------------------------------------------------
-# Background thread — monitors clip_queue, transcribes, dispatches.
-# ---------------------------------------------------------------------------
+# --- background thread: monitor clip_queue, transcribe, dispatch ---
 def _voice_trigger_thread(
     get_frame: Callable[[], Optional[np.ndarray]],
     get_detections: Optional[Callable[[], Optional[List[dict]]]],
@@ -334,9 +277,8 @@ def _voice_trigger_thread(
             transcript = transcribe_clip(audio_bytes, model=model)
             dispatch_command(transcript, get_frame, get_detections)
         except Exception as exc:
-            # A dispatch failure (bad clip, OCR/object-scan error) must never kill
-            # this thread — if it dies, every future voice command is silent,
-            # which is the exact A7 symptom. Log, speak a fallback, keep going.
+            # A dispatch failure must never kill this thread (that would silence
+            # every future command). Log, speak a fallback, keep going.
             print(f"[voice_trigger] dispatch failed: {exc}")
             try:
                 event_bus.publish(Event(
@@ -355,14 +297,8 @@ def start_voice_trigger_thread(
     get_frame: Callable[[], Optional[np.ndarray]],
     get_detections: Optional[Callable[[], Optional[List[dict]]]] = None,
 ) -> threading.Thread:
-    """Start the voice-trigger daemon thread and return it.
-
-    Args:
-        get_frame:       Latest BGR frame callable (main.get_latest_frame).
-        get_detections:  Optional callable returning Tier 1 YOLO detections
-                         [{"label": str, "bbox": (x1,y1,x2,y2)}, ...].
-                         Pass None until dev1/detection merges.
-    """
+    """Start the voice-trigger daemon thread and return it. get_frame is
+    main.get_latest_frame; get_detections yields [{"label", "bbox"}, ...] or None."""
     t = threading.Thread(
         target=_voice_trigger_thread,
         args=(get_frame, get_detections),
@@ -374,32 +310,16 @@ def start_voice_trigger_thread(
 
 
 if __name__ == "__main__":
-    """Standalone test: simulate a phone clip arriving on clip_queue.
-
-    Usage:
-        env_aakha/bin/python audio/voice_trigger.py
-        VOSK_MODEL_PATH=/path/to/model env_aakha/bin/python audio/voice_trigger.py
-
-    Requires the Vosk model to be present. Simulates each of the 4 commands
-    by injecting pre-recorded phrases as PCM bytes (silence used here — you
-    can replace with a real WAV file).
-    """
-    import struct
-    from audio.consumer import start_consumer
+    # Standalone: exercise keyword dispatch directly (bypassing Vosk).
+    from src.audio.consumer import start_consumer
 
     model_path = os.environ.get("VOSK_MODEL_PATH", _DEFAULT_MODEL_PATH)
     if not os.path.isdir(model_path):
         print(f"[test] Vosk model not found at: {model_path}")
-        print("[test] Download vosk-model-small-en-us-0.15.zip from:")
-        print("[test]   https://alphacephei.com/vosk/models")
         sys.exit(1)
 
-    print("[test] Starting TTS consumer...")
     start_consumer()
     time.sleep(0.3)
-
-    # Test keyword dispatch directly (bypassing Vosk transcription).
-    print("[test] Testing keyword dispatch directly...")
 
     def _fake_frame():
         return np.zeros((480, 640, 3), dtype=np.uint8)

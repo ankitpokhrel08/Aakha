@@ -1,22 +1,8 @@
 """App entry point. ``run()`` starts every worker thread and then blocks.
 
-Thread layout after Dev 2 merges:
-  _vision_producer  — Tier 1 stub (dev1/detection will replace this)
-  _audio_consumer   — pyttsx3 priority-queue consumer (audio/consumer.py)
-  _ocr              — Tesseract on Enter keypress (visuals/ocr.py)
-  _voice_trigger    — Vosk wake-word + MediaPipe Hands (audio/voice_trigger.py)
-
-Shared frame slot:
-  The OCR and voice-trigger threads call ``get_latest_frame()``,
-  which reads a BGR numpy array written by the vision thread. Until dev1/detection
-  merges the stub leaves it None, so those threads idle without processing.
-  When dev1 merges, its loop should call ``set_latest_frame(frame)`` each tick.
-
-Shared detections slot:
-  The voice-trigger thread calls ``get_latest_detections()`` to match the held
-  object to a YOLO label. Stays None until dev1/detection merges; voice_trigger
-  handles this gracefully (reports hand visible but object unlabelled).
-  When dev1 merges, its loop should call ``set_latest_detections(dets)`` each tick.
+Workers: _vision_producer (detection), _audio_consumer (TTS/beep), _ocr,
+_voice_trigger. The vision loop writes the shared frame/detection slots below;
+the OCR and voice threads read them and idle until a frame is available.
 """
 from __future__ import annotations
 
@@ -27,70 +13,56 @@ from typing import Optional
 
 import numpy as np
 
-from shared.bus import event_bus  # noqa: F401  wired so the contract is live
-from shared.events import Event, Priority
+from src.core.bus import event_bus  # noqa: F401  keep the contract live
+from src.core.events import Event, Priority
 
-# Populated by run(); smoke_test.py inspects this to confirm threads are alive.
+# Populated by run(); smoke_test inspects this to confirm threads are alive.
 WORKER_THREADS: list[threading.Thread] = []
 
-# ---------------------------------------------------------------------------
-# Shared frame slot — written by Tier 1, read by Tier 2/3
-# ---------------------------------------------------------------------------
+# --- shared frame slot: written by vision, read by OCR/voice ---
 _frame_lock = threading.Lock()
 _latest_frame: Optional[np.ndarray] = None
 
 
 def get_latest_frame() -> Optional[np.ndarray]:
-    """Return the most recent BGR frame from the vision thread, or None."""
     with _frame_lock:
         return _latest_frame
 
 
 def set_latest_frame(frame: np.ndarray) -> None:
-    """Called by the Tier 1 vision thread each time a new frame is processed."""
     global _latest_frame
     with _frame_lock:
         _latest_frame = frame
 
 
-# ---------------------------------------------------------------------------
-# Shared detections slot — written by Tier 1, read by voice_trigger (Tier 3)
-# ---------------------------------------------------------------------------
+# --- shared detections slot: written by vision, read by voice ("what am I holding") ---
 _detections_lock = threading.Lock()
 _latest_detections: Optional[list] = None
 
 
 def get_latest_detections() -> Optional[list]:
-    """Return the latest list of YOLO detections, or None until Tier 1 merges.
-
-    Each entry: {"label": str, "bbox": (x1, y1, x2, y2)}
-    """
+    """Latest detections as [{"label": str, "bbox": (x1, y1, x2, y2)}, ...]."""
     with _detections_lock:
         return _latest_detections
 
 
 def set_latest_detections(detections: list) -> None:
-    """Called by the Tier 1 vision thread after each YOLO inference pass."""
     global _latest_detections
     with _detections_lock:
         _latest_detections = detections
 
 
-# ---------------------------------------------------------------------------
-# Incoming frame slot — written by the server (phone camera), read by Tier 1
-# ---------------------------------------------------------------------------
+# --- incoming frame slot: written by the server (phone camera), read by vision ---
 _incoming_lock = threading.Lock()
 _incoming_frame: Optional[np.ndarray] = None
 
-# When set (server.py does this on startup), the vision thread consumes pushed
-# frames from here instead of opening a local camera. Left None for the
-# `python main.py` local-webcam / VISION_SOURCE path.
+# When set by the server on startup, vision consumes pushed frames instead of
+# opening a local camera. None for the `python main.py` webcam/VISION_SOURCE path.
 FRAME_SOURCE = None
 
 
 def push_frame(jpeg_or_array) -> None:
-    """Feed a frame into the pipeline. Accepts raw JPEG bytes (decoded here) or a
-    BGR numpy array. server.py wires its /camera websocket to this."""
+    """Feed a frame in. Accepts raw JPEG bytes (decoded here) or a BGR array."""
     global _incoming_frame
     frame = jpeg_or_array
     if isinstance(jpeg_or_array, (bytes, bytearray)):
@@ -104,56 +76,40 @@ def push_frame(jpeg_or_array) -> None:
 
 
 def get_incoming_frame() -> Optional[np.ndarray]:
-    """Latest frame pushed by the server (phone camera), or None."""
     with _incoming_lock:
         return _incoming_frame
 
 
 def clear_incoming_frame() -> None:
-    """Empty the pushed-frame slot so the vision loop goes idle.
-
-    Called by the server when navigation is toggled OFF. The vision loop reads
-    frames via ``get_incoming_frame`` (push mode); once this is None it hits the
-    ``frame is None`` branch in ``vision_loop`` and sleeps instead of
-    re-processing the last frame forever. No vision-side change needed."""
+    """Empty the pushed-frame slot so the vision loop idles (server pauses nav)."""
     global _incoming_frame
     with _incoming_lock:
         _incoming_frame = None
 
 
-# ---------------------------------------------------------------------------
-# Voice-session flag — True while the user is holding to talk / a voice command
-# is being handled. The phone signals this over /control (voice_start/voice_end);
-# the server sets it here. Tier 1 reads it to hush the on-track heartbeat beep so
-# it doesn't tick over a spoken command (V1). Kept here (not in server.py) so the
-# vision loop can read it without importing the web layer.
-# ---------------------------------------------------------------------------
+# --- voice-session flag: True while a voice command is being handled ---
+# Set by the server over /control. Vision reads it to hush the on-track beep so
+# it doesn't tick over a spoken command. Kept here so vision needn't import the
+# web layer.
 _voice_lock = threading.Lock()
 _voice_active = False
 
 
 def set_voice_active(on: bool) -> None:
-    """Called by the server when a voice session starts (True) / ends (False)."""
     global _voice_active
     with _voice_lock:
         _voice_active = bool(on)
 
 
 def get_voice_active() -> bool:
-    """True while a voice command is being recorded / handled."""
     with _voice_lock:
         return _voice_active
 
 
-# ---------------------------------------------------------------------------
-# Navigation-guidance gate — True while the user is actively navigating; False
-# when paused (app started & camera still streaming, but no obstacle/beep/path
-# guidance). The phone drives this over /control: tap = navigate, and after a
-# voice command it goes to paused (never auto-resumes). Kept separate from frame
-# flow so the camera keeps streaming while paused — that's what lets a voice
-# command still see the live frame. Defaults True so `python main.py` (local
-# webcam, no server) navigates out of the box; the server sets it False on boot.
-# ---------------------------------------------------------------------------
+# --- navigation gate: True while navigating, False while paused ---
+# When paused the camera keeps streaming (so a voice command still sees a frame)
+# but no guidance/beep is published. Defaults True so `python main.py` navigates
+# without a server; the server sets it False on boot.
 _nav_lock = threading.Lock()
 _nav_active = True
 
@@ -165,15 +121,11 @@ def set_nav_active(on: bool) -> None:
 
 
 def get_nav_active() -> bool:
-    """True while navigation guidance should be published (not paused)."""
     with _nav_lock:
         return _nav_active
 
 
-# ---------------------------------------------------------------------------
-# Annotated frame slot — written by Tier 1 (overlay drawn), read by the server
-# /monitor MJPEG stream so you can watch detections live on the laptop.
-# ---------------------------------------------------------------------------
+# --- annotated frame slot: written by vision, read by the server /monitor stream ---
 _annotated_lock = threading.Lock()
 _annotated_frame: Optional[np.ndarray] = None
 
@@ -185,59 +137,40 @@ def set_annotated_frame(frame: np.ndarray) -> None:
 
 
 def get_annotated_frame() -> Optional[np.ndarray]:
-    """Latest frame with detection overlay drawn, or None."""
     with _annotated_lock:
         return _annotated_frame
 
 
-# ---------------------------------------------------------------------------
-# Tier 1 producer — real YOLO11n vision loop (dev1/detection)
-# ---------------------------------------------------------------------------
 def _vision_producer() -> None:
-    """Run the real Tier 1 vision loop: YOLO11n detection + ByteTrack collision
-    + crosswalk + traffic-light, publishing events to the bus and feeding the
-    shared frame/detection slots for Tier 2/3.
-
-    Falls back to idling (thread stays alive) if the camera can't be opened, so
-    the smoke test and the Tier 2/3 threads that read get_latest_frame() don't
-    die on a headless machine.
-    """
-    # Startup marker so smoke_test sees qsize() > 0 immediately, and the
-    # dashboard shows the vision thread came up.
-    event_bus.publish(Event(
-        message="Vision thread started.",
-        priority=Priority.LOW,
-        type="system",
-        source="vision",
-    ))
+    """Run the vision loop, feeding the shared slots. Idles (thread stays alive)
+    if the camera can't be opened, so headless machines don't crash the app."""
+    event_bus.publish(Event("Vision thread started.", Priority.LOW, "system", "vision"))
 
     def _on_detections(dets: list) -> None:
-        # Adapt Tier 1 dicts to the shape voice_trigger expects.
         set_latest_detections([
             {"label": d["name"], "bbox": tuple(int(v) for v in d["box"])}
             for d in dets
         ])
 
-    # Source is the webcam (0) by default; point it at a file for testing with
-    #   VISION_SOURCE=assets/cars.mp4 python main.py
+    # Webcam (0) by default; VISION_SOURCE=clip.mp4 to run on a file.
     src_env = os.environ.get("VISION_SOURCE", "0")
     source = int(src_env) if src_env.isdigit() else src_env
 
     try:
         from config import config
-        from vision.detect import vision_loop
+        from src.vision.detect import vision_loop
         vision_loop(
             source=source,
-            frames=FRAME_SOURCE,  # push mode when the server fed phone frames
+            frames=FRAME_SOURCE,  # push mode when the server feeds phone frames
             show=False,           # GUI must stay on the main thread on macOS
             publish=True,
             crosswalk=config.crosswalk_detection,
             traffic_light=config.traffic_light_detection,
             on_frame=set_latest_frame,
             on_detections=_on_detections,
-            on_annotated=set_annotated_frame,  # feed the /monitor live view
-            voice_active=get_voice_active,     # hush guidance during voice cmds
-            nav_active=get_nav_active,         # mute guidance while paused
+            on_annotated=set_annotated_frame,
+            voice_active=get_voice_active,
+            nav_active=get_nav_active,
         )
     except Exception as exc:  # camera missing, permission denied, source ended
         print(f"[vision] loop stopped ({exc}); thread idling")
@@ -246,44 +179,28 @@ def _vision_producer() -> None:
         time.sleep(1.0)
 
 
-# ---------------------------------------------------------------------------
-# Workers
-# ---------------------------------------------------------------------------
 def start_workers() -> list[threading.Thread]:
     """Start all daemon workers and record them in WORKER_THREADS."""
-    from audio.consumer import start_consumer
-    from audio.voice_trigger import start_voice_trigger_thread
-    from visuals.ocr import start_ocr_thread
+    from src.audio.consumer import start_consumer
+    from src.audio.voice_trigger import start_voice_trigger_thread
+    from src.vision.ocr import start_ocr_thread
 
     WORKER_THREADS.clear()
 
-    # Tier 1 real vision loop (local camera, VISION_SOURCE file, or pushed
-    # frames when FRAME_SOURCE was set by the server).
     vision_thread = threading.Thread(
         target=_vision_producer, name="_vision_producer", daemon=True
     )
     vision_thread.start()
     WORKER_THREADS.append(vision_thread)
-
-    # Tier 2 audio consumer.
     WORKER_THREADS.append(start_consumer())
-
-    # Tier 3 OCR — triggered by pressing Enter; idles when no frame available.
     WORKER_THREADS.append(start_ocr_thread(get_latest_frame))
-
-    # Tier 3 voice trigger — idles if Vosk model not present; get_detections
-    # is None until dev1/detection merges, handled gracefully inside the thread.
     WORKER_THREADS.append(start_voice_trigger_thread(
-        get_latest_frame,
-        get_detections=get_latest_detections,
-    ))
-
+        get_latest_frame, get_detections=get_latest_detections))
     return WORKER_THREADS
 
 
 def run(block: bool = True) -> list[threading.Thread]:
-    """Start workers. Blocks the calling thread by default (real app use);
-    pass block=False to start workers and return their handles."""
+    """Start workers. Blocks by default; pass block=False to just get the handles."""
     threads = start_workers()
     if block:
         try:

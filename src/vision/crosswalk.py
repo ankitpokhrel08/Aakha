@@ -1,18 +1,9 @@
-"""Tier 1 crosswalk (zebra-stripe) detection — classic CV, no ML.
+"""Crosswalk (zebra-stripe) detection — classic CV, no ML.
 
-A zebra crossing seen from a pedestrian's viewpoint is a stack of bright
-parallel bars near the bottom of the frame. Their top/bottom edges show up as
-several roughly-horizontal lines spread across distinct vertical bands. We:
-
-  1. take a region of interest (lower part of the frame),
-  2. Canny edge-detect it,
-  3. probabilistic Hough transform to get line segments,
-  4. keep only near-horizontal segments,
-  5. declare a crosswalk when those segments span enough distinct y-bands
-     (one bar alone — a curb, a crack — isn't enough).
-
-A short temporal persistence + cooldown avoids single-frame flicker and TTS
-spam. Costs ~5-10ms/frame, no model. Tunable; expect to retune outdoors.
+A zebra crossing is a stack of bright parallel bars near the frame bottom. On a
+lower-central ROI: Canny -> probabilistic Hough -> keep near-horizontal segments
+-> declare a crosswalk when they span enough distinct y-bands and the ROI reads
+black-and-white. Persistence + cooldown avoid flicker and TTS spam.
 """
 from __future__ import annotations
 

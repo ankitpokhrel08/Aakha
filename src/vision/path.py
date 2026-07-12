@@ -1,22 +1,10 @@
-"""Tier 1 path guidance — clearest-path free-space + off-path drift (classic CV).
+"""Path guidance — clearest-path free-space + off-path drift (classic CV).
 
-Two cheap, model-free signals that answer "where should I go / am I leaving the
-path", built on things we already compute:
-
-  clearest_path(dets, w, h)
-      Split the lower frame into left / ahead / right corridors, score each by
-      nearby-obstacle occupancy (YOLO boxes weighted by how close/low they are),
-      and suggest the emptiest side when straight-ahead is clearly more blocked.
-
-  path_drift(frame)
-      Hough line edges in the lower frame -> dominant left/right path boundaries
-      -> where the walkable path sits at your feet vs the frame centre. If it's
-      off-centre with confidence, cue "ease left/right".
-
-PathGuide bundles both with debounce + hysteresis and returns the messages to
-publish. Advisory only, NORMAL priority — collision (CRITICAL) always wins.
-It prefers the drift ("stay on path") cue over the clearer-side suggestion so
-the two never contradict each other in the same breath.
+clearest_path(): score left/ahead/right by nearby-obstacle occupancy and suggest
+the emptiest side when straight-ahead is clearly more blocked. path_drift(): Hough
+path boundaries -> where the walkable path sits vs frame centre -> "ease
+left/right". PathGuide bundles both with debounce; advisory only (NORMAL), and
+prefers the drift cue so the two never contradict in one breath.
 """
 from __future__ import annotations
 
@@ -54,18 +42,12 @@ class PathResult:
     drift: dict = field(default_factory=dict)       # path_drift() output
 
 
-# --------------------------------------------------------------------------- #
-# Layer 1 — clearest-path free-space
-# --------------------------------------------------------------------------- #
+# --- clearest-path free-space ---
 def clearest_path(dets: list[dict], w: int, h: int, corridor=None) -> dict:
-    """Score left/ahead/right by nearby-obstacle occupancy and suggest the
-    emptiest side only when straight-ahead is clearly more blocked.
-
-    With a corridor, ONLY obstacles whose ground contact is inside the walking
-    corridor are counted, and left/ahead/right are sub-columns *within* the
-    corridor — so a suggestion is always a small nudge onto walkable ground,
-    never "go left" into an empty road that just happens to have no objects.
-    """
+    """Score left/ahead/right by nearby-obstacle occupancy; suggest the emptiest
+    side only when straight-ahead is clearly more blocked. With a corridor, only
+    in-corridor obstacles count and the zones are sub-columns within it, so a
+    suggestion is a nudge onto walkable ground, not into an empty road."""
     score = {"left": 0.0, "ahead": 0.0, "right": 0.0}
     near_y = h * NEAR_FRAC
     if corridor is not None:
@@ -94,9 +76,7 @@ def clearest_path(dets: list[dict], w: int, h: int, corridor=None) -> dict:
     return {"scores": score, "suggest": suggest}
 
 
-# --------------------------------------------------------------------------- #
-# Layer 2 — off-path drift from path-edge Hough lines
-# --------------------------------------------------------------------------- #
+# --- off-path drift from path-edge Hough lines ---
 def path_drift(frame) -> dict:
     """Estimate lateral offset of the walkable path at your feet vs frame centre.
 
@@ -150,14 +130,11 @@ def path_drift(frame) -> dict:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Monitor — bundle both signals with debounce + hysteresis
-# --------------------------------------------------------------------------- #
+# --- monitor: bundle both signals with debounce ---
 class PathGuide:
     def __init__(self, emit_drift: bool = False) -> None:
-        # emit_drift: the "ease left/right" off-path cue. OFF by default — it's
-        # noisy on wide-angle bodycams (fisheye bends the edge lines) and
-        # confusing as speech. Steering belongs on a tone/haptic channel.
+        # emit_drift (the "ease left/right" cue) is OFF by default: noisy on
+        # wide-angle lenses and confusing as speech (belongs on a tone channel).
         self.emit_drift = emit_drift
         self._last_drift = float("-inf")
         self._last_clear = float("-inf")
@@ -187,9 +164,7 @@ class PathGuide:
         return result, messages
 
 
-# --------------------------------------------------------------------------- #
-# Overlay
-# --------------------------------------------------------------------------- #
+# --- overlay ---
 def annotate_path(frame, result: PathResult) -> None:
     """Draw path boundaries, the estimated path centre, and any cue."""
     h, w = frame.shape[:2]

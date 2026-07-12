@@ -1,33 +1,13 @@
-"""VisionAid web layer — phone camera client + dashboard over WebSockets.
+"""Web layer — phone camera client + dashboard over WebSockets.
 
-Dev 3 / mobile-client. This is the "Option 1" rig from the plan: the phone runs
-a lightweight browser client that streams its camera to this laptop backend over
-WiFi; inference happens here; the sighted dashboard watches the event bus.
+The phone streams its camera here over WiFi; inference runs on the laptop; the
+dashboard watches the event bus. Endpoints: GET / (single-button client), GET
+/dashboard, WS /camera (JPEG in), /control, /audio (voice clip in), /status.
 
-Endpoints
----------
-GET  /            fullscreen single-button end-user page (camera + toggle)
-GET  /dashboard   sighted-teammate view: connection light + scrolling event log
-WS   /camera      browser -> server: JPEG frames, handed to on_frame() callback
-WS   /control     browser -> server: {"action": "nav_on"|"nav_off"|"nav_pause"|
-                  "voice_start"|"voice_end"} etc.
-WS   /status      server -> browser: event-bus activity + per-thread heartbeats
-
-Import-safety
--------------
-The whole team's ``shared/smoke_test.py`` imports ``main`` which may import this
-module. Nothing here blocks or starts a server/thread at import time — the app
-object is built, callbacks default to no-ops, and the only side effects (bus
-tap, worker start, heartbeat loop) happen in the FastAPI ``startup`` handler,
-i.e. only when uvicorn actually runs. ``import server`` is always safe.
-
-Bus contract
-------------
-``shared/bus.py`` is a single-consumer priority queue (the one audio/TTS
-thread drains it). The dashboard must *observe* events without *stealing* them,
-so instead of calling ``event_bus.get()`` here we install a non-destructive tap:
-we wrap the singleton's ``publish`` at runtime to mirror a copy of every event
-to status subscribers. shared/bus.py itself is never modified (frozen contract).
+Import-safe: nothing starts a server or thread at import time; side effects
+(bus tap, worker start, heartbeat) happen only in the FastAPI startup handler.
+The dashboard observes events via a non-destructive tap that wraps the bus's
+publish (the bus stays a single-consumer queue; it's never modified).
 """
 from __future__ import annotations
 
@@ -40,53 +20,40 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
-import web_assets
+from src.server import web_assets
 from config import config
-from shared.bus import event_bus
-from shared.events import Event, Priority
+from src.core.bus import event_bus
+from src.core.events import Event, Priority
 
 logger = logging.getLogger("visionaid.server")
 
 app = FastAPI(title="VisionAid mobile-client")
 
-# Shared UI/runtime state. `active` reflects the toggle button; the vision
-# pipeline can read it later to decide whether to emit guidance.
+# `active` reflects the toggle button; the pipeline reads it to gate guidance.
 STATE: dict[str, Any] = {"active": False, "frames_received": 0}
 
-# When True, the FastAPI startup handler also boots main.run(block=False) so a
-# plain `python server.py` brings the whole system up (workers + web). Set to
-# False if you want to run the web layer against externally-started workers.
+# When True, the startup handler also boots main.run(block=False) so running the
+# server brings up workers + web together.
 START_WORKERS = True
 
 HEARTBEAT_INTERVAL_S = 2.0
 
 
-# --------------------------------------------------------------------------- #
-# Frame callback — wired to the vision pipeline later.
-# --------------------------------------------------------------------------- #
 def _default_on_frame(frame: bytes) -> None:
-    """Placeholder. dev1/vision replaces this via set_frame_callback() with the
-    real decode + YOLO handoff. Kept a no-op so /camera works before vision
-    exists."""
-    # Intentionally cheap: just count so the dashboard/logs show frames arriving.
+    """No-op placeholder so /camera works before the vision handler is wired."""
     STATE["frames_received"] += 1
 
 
-# Module-level reference the vision team wires up. Call set_frame_callback(fn).
 on_frame: Callable[[bytes], None] = _default_on_frame
 
 
 def set_frame_callback(fn: Callable[[bytes], None]) -> None:
     """Point /camera at the real vision handler. `fn` takes raw JPEG bytes and
-    must return quickly (it runs on the websocket receive path) — hand heavy
-    work to the vision thread rather than blocking here."""
+    must return quickly (it runs on the websocket receive path)."""
     global on_frame
     on_frame = fn
 
 
-# --------------------------------------------------------------------------- #
-# Status fan-out hub — one asyncio.Queue per connected /status client.
-# --------------------------------------------------------------------------- #
 class StatusHub:
     """Broadcasts JSON payloads to every connected /status websocket.
 
@@ -132,9 +99,7 @@ _loop: Optional[asyncio.AbstractEventLoop] = None
 _heartbeat_task: Optional[asyncio.Task] = None
 
 
-# --------------------------------------------------------------------------- #
-# Non-destructive bus tap.
-# --------------------------------------------------------------------------- #
+# --- non-destructive bus tap ---
 def _event_to_payload(event: Event) -> dict:
     try:
         priority_val = int(event.priority)
@@ -220,33 +185,25 @@ async def _heartbeat_loop() -> None:
         logger.exception("heartbeat loop crashed")
 
 
-# --------------------------------------------------------------------------- #
-# Lifecycle.
-# --------------------------------------------------------------------------- #
+# --- lifecycle ---
 @app.on_event("startup")
 async def _on_startup() -> None:
     global _loop, _heartbeat_task
     _loop = asyncio.get_running_loop()
     _install_bus_tap()
 
-    # Live config: reload config.json when it changes on disk, and let the
-    # /control "set" action flip toggles mid-run. Watcher is a daemon thread.
-    config.start_watching()
+    config.start_watching()   # reload config.json on change; /control can flip toggles
 
     if START_WORKERS:
         try:
             import main
 
-            # Wire the phone camera into the pipeline: /camera frames -> vision.
-            # main.push_frame decodes each JPEG; the vision thread consumes them
-            # (push mode) instead of opening a local webcam. Must be set BEFORE
-            # main.run() so the vision thread picks push mode at startup.
+            # Push mode: /camera JPEGs -> main.push_frame -> the vision thread,
+            # instead of a local webcam. Set before main.run() so it starts in push mode.
             main.FRAME_SOURCE = main.get_incoming_frame
             set_frame_callback(main.push_frame)
 
-            # Start PAUSED: the app comes up asking the user to tap to start
-            # navigation. Guidance stays muted until the first nav_on. (main
-            # defaults nav_active True for the standalone `python main.py` path.)
+            # Start paused: guidance stays muted until the first nav_on tap.
             main.set_nav_active(False)
 
             if not getattr(main, "WORKER_THREADS", []):
@@ -269,9 +226,7 @@ async def _on_shutdown() -> None:
             pass
 
 
-# --------------------------------------------------------------------------- #
-# WebSocket endpoints.
-# --------------------------------------------------------------------------- #
+# --- WebSocket endpoints ---
 @app.websocket("/camera")
 async def camera_ws(ws: WebSocket) -> None:
     """Receive JPEG frames (binary) from the browser and hand each to on_frame."""
@@ -280,12 +235,8 @@ async def camera_ws(ws: WebSocket) -> None:
     try:
         while True:
             frame = await ws.receive_bytes()
-            # Always feed frames while the client is streaming (which it does the
-            # whole time the app is "started", navigating or paused). The pipeline
-            # keeps the latest frame + detections fresh so a voice command ("read
-            # this" / "what am I holding") can see live camera output even while
-            # navigation is paused. Guidance itself is gated separately by the
-            # nav-active flag, not by dropping frames.
+            # Feed frames whenever streaming (even while paused) so a voice command
+            # sees a live frame; guidance is gated by nav_active, not by dropping frames.
             try:
                 on_frame(frame)
             except Exception:
@@ -335,9 +286,7 @@ async def control_ws(ws: WebSocket) -> None:
                     )
                 await ws.send_json({"ok": True, "active": on})
             elif action in ("voice_start", "voice_end"):
-                # Phone hold-to-talk boundaries. While a voice session is live the
-                # Tier 1 loop hushes the on-track heartbeat beep so it doesn't tick
-                # over the spoken command / its reply (V1).
+                # Hold-to-talk boundaries; a live voice session hushes the beep.
                 try:
                     import main
                     main.set_voice_active(action == "voice_start")
@@ -345,10 +294,9 @@ async def control_ws(ws: WebSocket) -> None:
                     logger.debug("could not set voice_active", exc_info=True)
                 await ws.send_json({"ok": True})
             elif action == "get":
-                # Return current settings so a dashboard can render controls.
                 await ws.send_json({"ok": True, "config": config.to_dict()})
             elif action == "set":
-                # Flip a config value at runtime, e.g. cut traffic-light:
+                # Flip a config value at runtime, e.g.
                 #   {"action":"set","key":"traffic_light_detection","value":false}
                 key = (msg or {}).get("key")
                 value = (msg or {}).get("value")
@@ -362,8 +310,7 @@ async def control_ws(ws: WebSocket) -> None:
                 else:
                     changed = config.update(**{key: value})  # persists to config.json
                     current = config.to_dict()
-                    # Mirror onto the bus so the change shows on the dashboard
-                    # (and is spoken as a low-priority confirmation).
+                    # Mirror onto the bus so it shows on the dashboard + is confirmed.
                     event_bus.publish(
                         Event(
                             message=f"{key} set to {current[key]}",
@@ -382,17 +329,10 @@ async def control_ws(ws: WebSocket) -> None:
         logger.exception("control ws error")
 
 
-# --------------------------------------------------------------------------- #
-# Voice-command transcript echo (A4).
-#
-# The voice_trigger thread transcribes each clip and dispatches the command, but
-# it's frozen this round and never puts the *raw transcript* on the bus — only
-# the command result. So we can't tell whether recognition happened, or what it
-# heard. To echo it, the server transcribes the same clip with its own cached
-# Vosk model and publishes a `voice_heard` event ("Heard: ...") that shows on the
-# dashboard, speaks on the phone, and logs to the server console. The extra
-# transcription is cheap (voice commands are user-initiated and rare).
-# --------------------------------------------------------------------------- #
+# --- voice-command transcript echo ---
+# The server transcribes each clip with its own cached Vosk model and publishes a
+# "Heard: ..." event, so the dashboard/phone/console can see what was recognised
+# (voice_trigger only publishes the command result, not the raw transcript).
 _voice_model = None
 _voice_model_lock = threading.Lock()
 _voice_model_tried = False
@@ -405,7 +345,7 @@ def _get_voice_model():
         if _voice_model is None and not _voice_model_tried:
             _voice_model_tried = True
             try:
-                from audio.voice_trigger import _load_vosk_model
+                from src.audio.voice_trigger import _load_vosk_model
                 _voice_model = _load_vosk_model()  # None if model dir absent
             except Exception:
                 logger.exception("could not load Vosk model for transcript echo")
@@ -419,7 +359,7 @@ def _transcribe_for_echo(clip: bytes) -> Optional[str]:
     if model is None:
         return None
     try:
-        from audio.voice_trigger import transcribe_clip
+        from src.audio.voice_trigger import transcribe_clip
         return transcribe_clip(clip, model=model)
     except Exception:
         logger.exception("echo transcription failed")
@@ -453,15 +393,14 @@ async def audio_ws(ws: WebSocket) -> None:
     await ws.accept()
     logger.info("audio client connected")
     try:
-        from audio.voice_trigger import clip_queue
+        from src.audio.voice_trigger import clip_queue
     except Exception:
         logger.exception("voice_trigger unavailable; /audio will drop clips")
         clip_queue = None
     try:
         while True:
             clip = await ws.receive_bytes()
-            # A3: confirm capture — log size + duration (16 kHz mono PCM16 => 2 bytes/sample).
-            n = len(clip)
+            n = len(clip)   # 16 kHz mono PCM16 => 2 bytes/sample
             secs = n / 2 / 16000
             if n == 0:
                 logger.warning("audio clip EMPTY (0 bytes) — capture produced nothing")
@@ -469,10 +408,8 @@ async def audio_ws(ws: WebSocket) -> None:
                 logger.info("audio clip received: %d bytes (~%.2fs @16kHz mono)", n, secs)
             if clip_queue is not None:
                 clip_queue.put(clip)
-                # A voice command is now executing — keep the on-track beep hushed
-                # until the consumer finishes speaking the reply (it clears the
-                # flag then). Covers the execution window even if voice_start was
-                # late/missed; the consumer, not the phone, decides when it ends.
+                # Keep the beep hushed until the consumer finishes the reply (it
+                # clears the flag), even if voice_start was late/missed.
                 if n:
                     try:
                         import main
@@ -480,8 +417,7 @@ async def audio_ws(ws: WebSocket) -> None:
                     except Exception:
                         logger.debug("could not set voice_active", exc_info=True)
                 await ws.send_json({"ok": True, "bytes": n})
-                # A4: echo what was recognised back to phone/dashboard + console.
-                if n:
+                if n:   # echo what was recognised back to phone/dashboard/console
                     asyncio.create_task(_echo_transcript(clip))
     except WebSocketDisconnect:
         logger.info("audio client disconnected")
@@ -509,9 +445,7 @@ async def status_ws(ws: WebSocket) -> None:
         status_hub.unregister(q)
 
 
-# --------------------------------------------------------------------------- #
-# Static pages (inlined so there's no static-dir/path coupling to break import).
-# --------------------------------------------------------------------------- #
+# --- static pages (inlined so there's no static-dir coupling) ---
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return _INDEX_HTML
@@ -522,9 +456,7 @@ async def dashboard() -> str:
     return _DASHBOARD_HTML
 
 
-# --------------------------------------------------------------------------- #
-# PWA assets (manifest, service worker, audio worklet, icons).
-# --------------------------------------------------------------------------- #
+# --- PWA assets (manifest, service worker, audio worklet, icons) ---
 @app.get("/manifest.json")
 async def manifest() -> Response:
     return Response(web_assets.MANIFEST, media_type="application/manifest+json")
@@ -550,18 +482,16 @@ async def icon_512() -> Response:
     return Response(web_assets.icon_png(512), media_type="image/png")
 
 
-# On-track heartbeat beep, played in the browser on type="heartbeat" events while
-# navigation is ON (the phone is the speaker) — mirrors audio/consumer's laptop
-# afplay beep. Same Purr.mp3 the offline demo videos use (sound_asset/).
+# In-browser heartbeat beep (phone is the speaker); mirrors the laptop afplay beep.
 _BEEP_BYTES: Optional[bytes] = None
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 @app.get("/beep.mp3")
 async def beep_mp3() -> Response:
     global _BEEP_BYTES
     if _BEEP_BYTES is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "sound_asset", "Purr.mp3")
+        path = os.path.join(_ROOT, "sounds", "Purr.mp3")
         try:
             with open(path, "rb") as f:
                 _BEEP_BYTES = f.read()
@@ -571,12 +501,9 @@ async def beep_mp3() -> Response:
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-# Server-side speech for iOS. iOS Safari blocks the Web Speech API (especially as
-# an installed PWA), so the phone can't speak guidance itself — but it plays HTML5
-# <audio> fine (the beep proves it). So we synthesize each phrase here with macOS
-# `say` (same engine the offline demo videos use) and the iOS client fetches +
-# plays it through the same audio channel as the beep. Android keeps using its
-# native (working) SpeechSynthesis, so it never hits this route.
+# Server-side speech for iOS: Safari blocks the Web Speech API (esp. as a PWA) but
+# plays HTML5 <audio>, so we synthesize phrases with macOS `say` and the iOS client
+# fetches them over the same channel as the beep. Android uses its native TTS.
 _TTS_CACHE: dict[str, bytes] = {}
 _TTS_MAX = 256                      # cap the cache (ambient vocab is small; OCR varies)
 
@@ -624,9 +551,7 @@ async def tts(text: str = "") -> Response:
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-# --------------------------------------------------------------------------- #
-# Live monitor — watch the phone's stream WITH detection overlay on the laptop.
-# --------------------------------------------------------------------------- #
+# --- live monitor: the phone stream with detection overlay, on the laptop ---
 @app.get("/monitor", response_class=HTMLResponse)
 async def monitor() -> str:
     return _MONITOR_HTML

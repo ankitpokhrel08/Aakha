@@ -1,25 +1,13 @@
-"""Visualize what the monocular-depth free-space monitor actually sees.
+"""Visualize what the monocular-depth free-space monitor sees.
 
-For every clip in assets/wall/ (or any --source), render a side-by-side video:
-
-    [ camera frame ]  [ depth heat-map ]
-
-with the exact regions the B1 metric samples drawn on both panels — the central
-walking corridor column, the "at your feet" NEAR band, and the "a few steps
-ahead" AHEAD band — plus a live readout of the raw near-fraction, its smoothed
-EMA, and the WALL / free verdict (same EMA + hysteresis as vision/depth.py).
-
-Depth colour: red = near, blue = far (larger depth value = closer). An open path
-shows a smooth near(red, bottom) -> far(blue, top) gradient; a wall paints the
-AHEAD band red (as near as your feet) and trips the WALL verdict.
-
-Outputs one <clip>_depth.mp4 per clip into a single folder at the repo root
-(default: depth_overlays/).
+For each clip, render a side-by-side [camera | depth heat-map] video with the
+near_fraction sample regions drawn (corridor column, NEAR and AHEAD bands) and a
+live near-fraction / EMA / WALL-verdict readout (same EMA + hysteresis as
+src/vision/depth.py). Depth colour: red = near, blue = far.
 
 Usage (from the repo root):
     .venv/bin/python tools/depth_overlay.py                 # all assets/wall/*.mp4
-    .venv/bin/python tools/depth_overlay.py --source assets/clean_road.mp4
-    .venv/bin/python tools/depth_overlay.py --out depth_overlays --open
+    .venv/bin/python tools/depth_overlay.py --source assets/clean_road.mp4 --open
 """
 from __future__ import annotations
 
@@ -32,15 +20,15 @@ import sys
 import cv2
 import numpy as np
 
-# repo root on path so `vision` imports regardless of cwd
+# repo root on path so `src` imports regardless of cwd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vision.depth import (  # noqa: E402
+from src.vision.depth import (  # noqa: E402
     EMA_ALPHA, OFF_THRESHOLD, ON_THRESHOLD, DepthEstimator, near_fraction)
 
 PANEL_H = 720            # height of each side-by-side panel
 
-# Sample regions (must match near_fraction in vision/depth.py), as fractions.
+# Sample regions (must match near_fraction in src/vision/depth.py), as fractions.
 COL_X0, COL_X1 = 0.30, 0.70        # central corridor column
 NEAR_Y0 = 0.70                     # at-your-feet band (rows below this)
 AHEAD_Y0, AHEAD_Y1 = 0.30, 0.60    # a-few-steps-ahead band

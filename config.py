@@ -1,24 +1,14 @@
-"""Runtime settings for VisionAid.
+"""Runtime settings.
 
-One shared, mutable ``config`` object every module reads live. Thresholds and
-feature toggles can be flipped mid-run *without restarting the app* two ways:
+One shared, mutable ``config`` object read live by every module (mutated in
+place, never rebound, so threads see changes immediately). Flip toggles two
+ways: edit ``config.json`` (a watcher reloads it if ``start_watching()`` was
+called at boot), or ``config.update(...)`` from code (applies + persists).
 
-  1. Edit ``config.json`` on disk -> the file watcher reloads it within
-     ~``watch_interval`` seconds (call ``start_watching()`` once at boot).
-  2. Call ``config.update(traffic_light_detection=False)`` from code (e.g. a
-     server control action) -> applies live and persists to ``config.json``.
+Cut-list: if something is unstable, disable in order traffic_light_detection ->
+crosswalk_detection -> voice_trigger. Collision warning is never a toggle.
 
-Because the single ``config`` instance is mutated *in place* (never rebound),
-threads that captured a reference at startup see every change immediately — a
-detection loop just reads ``config.crosswalk_detection`` each frame.
-
-Cut-list rule (from CLAUDE.md / the plan): if something is unstable, cut in
-order traffic_light_detection -> crosswalk_detection -> voice_trigger. NEVER
-disable collision warning — it isn't even a toggle here, on purpose.
-
-Import-safe: loading is a guarded one-shot file read; a missing/broken
-config.json falls back to defaults instead of raising. The watcher thread is
-opt-in (``start_watching()``), never started at import.
+A missing/broken config.json falls back to defaults instead of raising.
 """
 from __future__ import annotations
 
@@ -46,7 +36,7 @@ class Config:
 
     # --- thresholds ---
     collision_distance_threshold_m: float = 1.5   # "very close" trigger distance
-    target_fps: int = 12                          # camera stream / Tier 1 budget
+    target_fps: int = 12                          # camera / detection budget
 
     # --- feature toggles (all on by default; flip off per the cut-list) ---
     crosswalk_detection: bool = True

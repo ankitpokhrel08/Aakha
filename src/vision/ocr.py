@@ -1,30 +1,17 @@
-"""Tier 3 — On-demand OCR via Apple's Vision framework (ocrmac), by keypress/voice.
+"""On-demand OCR via Apple's Vision framework (ocrmac), triggered by keypress/voice.
 
-Migrated from Tesseract, then from PaddleOCR. Tesseract produced garbled output on
-real-world camera photos (dark backgrounds, coloured text, signs, badges) that TTS
-would read literally ("Ri q ricl I P A N T…"). PaddleOCR PP-OCRv4 read cleanly but
-`paddlepaddle==2.6.2` deadlocks in its C++ predictor on Apple Silicon (inference
-never returns) — see ocr_migration.md.
-
-Apple's Vision framework is native to Apple Silicon (the laptop backend always runs
-on the Mac; the phone only streams frames), needs no model download, and reads such
-images cleanly at ~40 ms warm. We reach it through the tiny `ocrmac` wrapper, whose
-only non-stdlib dep is pyobjc-framework-Vision (already installed).
-
-A background thread listens on stdin. When the user presses Enter it grabs the
-latest frame, runs OCR, and publishes the extracted text as a LOW priority event.
-
-Public API (unchanged, so main.py / voice_trigger need no edits):
-    start_ocr_thread(get_frame) -> threading.Thread
-        get_frame: Callable[[], np.ndarray | None] — latest BGR frame or None.
-    _run_ocr(frame) -> str — read text from a BGR frame (used by voice "read this").
+Vision is native to Apple Silicon (the backend runs on the Mac), needs no model
+download, and reads camera photos cleanly at ~40 ms warm; earlier Tesseract/
+PaddleOCR attempts were garbled or deadlocked. A background thread reads Enter,
+OCRs the latest frame, and publishes the text as a LOW event. _run_ocr() is also
+called by the voice "read this" command. Degrades to no-op off macOS.
 """
 from __future__ import annotations
 
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import threading
 import time
@@ -34,32 +21,23 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from shared.bus import event_bus
-from shared.events import Event, Priority
+from src.core.bus import event_bus
+from src.core.events import Event, Priority
 
-# The "accurate" Vision backend. "vision" returns clean line-level results with real
-# per-line confidence; "livetext" is slower and fragments text into single tokens.
+# "vision" backend: clean line-level results with per-line confidence.
 _FRAMEWORK = "vision"
-# Vision's predictor isn't guaranteed thread-safe and OCR calls are rare +
-# user-triggered, so serialise inference with a cheap lock.
-_infer_lock = threading.Lock()
-# Confidence floor: drop low-confidence logo/background fragments while keeping
-# real text. Vision reports 0..1 per line on the "vision" backend.
-_MIN_CONF = 0.4
+_infer_lock = threading.Lock()   # Vision's predictor isn't guaranteed thread-safe
+_MIN_CONF = 0.4                   # drop low-confidence logo/background fragments
 
-# Resolved lazily: the ocrmac.OCR callable, or None if ocrmac/Vision is unavailable
-# (e.g. non-macOS). None means "no OCR" rather than a crashed thread.
+# ocrmac.OCR, resolved lazily; None if ocrmac/Vision is unavailable (non-macOS).
 _ocr_cls = None
 _ocr_lock = threading.Lock()
 _ocr_probed = False
 
 
 def _get_ocr():
-    """Return ocrmac's OCR class, or None if Vision/ocrmac isn't available.
-
-    Resolves lazily on first call. Returns None (with a hint) instead of raising, so
-    a machine without ocrmac/Vision simply gets no OCR rather than a crashed thread.
-    """
+    """Return ocrmac's OCR class (resolved lazily), or None if unavailable —
+    no OCR rather than a crashed thread."""
     global _ocr_cls, _ocr_probed
     if _ocr_probed:
         return _ocr_cls
@@ -77,11 +55,7 @@ def _get_ocr():
 
 
 def _run_ocr(frame: np.ndarray) -> str:
-    """Run Apple Vision OCR on a BGR frame; return the read text (stripped) or "".
-
-    Passes the frame straight through as a PIL image (no temp file needed). Lines are
-    returned top-to-bottom, left-to-right so the text reads in natural order.
-    """
+    """Run Apple Vision OCR on a BGR frame; return the read text (stripped) or ""."""
     ocr_cls = _get_ocr()
     if ocr_cls is None or frame is None:
         return ""
@@ -95,9 +69,8 @@ def _run_ocr(frame: np.ndarray) -> str:
         return ""
     if not annotations:
         return ""
-    # Each annotation is (text, confidence, [x, y, w, h]) with normalised, bottom-left
-    # origin coords — higher y is higher up the image. Sort top-to-bottom then
-    # left-to-right so multi-line signs read in the order a person would read them.
+    # annotations are (text, conf, [x, y, w, h]) with bottom-left origin; sort
+    # top-to-bottom then left-to-right so multi-line signs read in natural order.
     kept = [(t, box) for (t, conf, box) in annotations if conf >= _MIN_CONF and t.strip()]
     kept.sort(key=lambda tb: (-round(tb[1][1], 2), tb[1][0]))
     return " ".join(t.strip() for (t, _) in kept).strip()
@@ -105,13 +78,10 @@ def _run_ocr(frame: np.ndarray) -> str:
 
 def _ocr_thread(get_frame: Callable[[], Optional[np.ndarray]]) -> None:
     """Block on stdin; on each Enter press, OCR the latest frame and publish."""
-    # Warm the engine at thread start so the first "read this" isn't a cold start.
-    _get_ocr()
+    _get_ocr()   # warm the engine so the first read isn't a cold start
 
     if not sys.stdin.isatty():
-        # Non-interactive context (smoke test, pipe) — idle silently.
-        # Keypress triggering only makes sense when a human is at the terminal.
-        while True:
+        while True:          # non-interactive (smoke test, pipe) — idle
             time.sleep(60.0)
         return
 
@@ -123,8 +93,7 @@ def _ocr_thread(get_frame: Callable[[], Optional[np.ndarray]]) -> None:
             time.sleep(1.0)
             continue
 
-        if not line:
-            # EOF on stdin — stop spinning, just idle.
+        if not line:          # EOF on stdin — idle
             time.sleep(1.0)
             continue
 
@@ -154,12 +123,8 @@ def _ocr_thread(get_frame: Callable[[], Optional[np.ndarray]]) -> None:
 def start_ocr_thread(
     get_frame: Callable[[], Optional[np.ndarray]],
 ) -> threading.Thread:
-    """Start the OCR daemon thread and return it.
-
-    Args:
-        get_frame: Callable returning the latest BGR frame or None.
-                   main.py provides get_latest_frame(); tests pass a lambda.
-    """
+    """Start the OCR daemon thread and return it. get_frame returns the latest
+    BGR frame or None (main provides get_latest_frame)."""
     t = threading.Thread(
         target=_ocr_thread,
         args=(get_frame,),
@@ -171,17 +136,12 @@ def start_ocr_thread(
 
 
 if __name__ == "__main__":
-    """Standalone test: OCR a provided image file and confirm warm timing <500ms.
-
-    Usage:
-        TEST_IMAGE=/path/to/image.jpg .venv/bin/python visuals/ocr.py
-    """
-    from audio.consumer import start_consumer
+    # Standalone: OCR an image (TEST_IMAGE=...) and check warm timing < 500 ms.
+    from src.audio.consumer import start_consumer
 
     test_image_path = os.environ.get("TEST_IMAGE")
     if not test_image_path or not os.path.exists(test_image_path):
-        print("Usage: TEST_IMAGE=/path/to/image.jpg python visuals/ocr.py")
-        print("Image should contain some readable text for a meaningful test.")
+        print("Usage: TEST_IMAGE=/path/to/image.jpg python -m src.vision.ocr")
         sys.exit(1)
 
     frame = cv2.imread(test_image_path)
@@ -190,12 +150,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"[test] Loaded image: {test_image_path} {frame.shape}")
-    print("[test] Starting TTS consumer...")
     start_consumer()
-
-    # Warm the engine first so we time WARM inference (not the one-time load).
-    print("[test] Loading Apple Vision OCR (one-time)...")
-    _get_ocr()
+    _get_ocr()        # warm so we time warm inference, not the one-time load
     _run_ocr(frame)
 
     print("[test] Running OCR...")

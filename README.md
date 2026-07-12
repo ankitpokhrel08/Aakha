@@ -40,7 +40,7 @@ unzip -q /tmp/vosk.zip -d .   # -> ./vosk-model-small-en-us-0.15/
 Two terminals. Pipeline + web server:
 
 ```bash
-.venv/bin/python server.py     # http://0.0.0.0:8000
+.venv/bin/python -m src.server.server     # http://0.0.0.0:8000
 ```
 
 HTTPS tunnel for the phone:
@@ -88,7 +88,7 @@ the command list. Either way it returns to paused; tap to resume.
 | Event / thread dashboard | `http://localhost:8000/dashboard` |
 | Laptop webcam, no phone | `.venv/bin/python main.py` |
 | Video file instead of camera | `VISION_SOURCE=path/to/clip.mp4 .venv/bin/python main.py` |
-| Smoke test (merge gate) | `.venv/bin/python shared/smoke_test.py` |
+| Smoke test (merge gate) | `.venv/bin/python -m src.core.smoke_test` |
 
 ## Stop
 

@@ -1,16 +1,9 @@
-"""Tier 1 collision / approach warnings from bbox growth.
+"""Collision / approach warnings from bbox growth ("looming").
 
-Monocular "looming" heuristic: an object whose bounding box is both (a) large
-in the frame — i.e. close — and (b) growing quickly — i.e. approaching — is a
-collision risk. We track each ByteTrack id's smoothed bbox area over time and
-fire when the fractional growth-per-second crosses a threshold while the object
-already occupies a meaningful share of the frame.
-
-No ML here — pure arithmetic on the areas the tracker already gives us, which
-is why it costs ~nothing on top of detection (per the Tier 1 budget).
-
-Feed it observations via update(); it returns a growth-rate when a warning
-should fire (else None). The caller turns that into a CRITICAL Event.
+An object whose smoothed bbox area is both large (close) and growing fast
+(approaching) is a collision risk. Pure arithmetic on per-track areas, so it
+costs ~nothing. update() returns a growth-rate when a warning should fire, else
+None; the caller turns that into a CRITICAL Event.
 """
 from __future__ import annotations
 
@@ -22,9 +15,7 @@ from typing import Optional
 class _Track:
     ema_area: float   # smoothed bbox area
     last_t: float     # timestamp of last observation
-    # -inf so the first qualifying observation always clears the cooldown,
-    # regardless of the clock's origin (wall clock vs monotonic-from-zero).
-    last_alert_t: float = float("-inf")
+    last_alert_t: float = float("-inf")   # -inf so the first alert always clears cooldown
 
 
 class CollisionMonitor:
@@ -50,12 +41,8 @@ class CollisionMonitor:
 
     def update(self, track_id: int, area: float, frame_area: float,
                now: float) -> Optional[float]:
-        """Feed one bbox observation for a track.
-
-        Returns the growth-rate (fraction/sec) when this observation should
-        trigger a collision warning, otherwise None. The first observation for
-        a track always returns None (need two samples to measure growth).
-        """
+        """Feed one bbox observation; return the growth-rate (fraction/sec) when a
+        warning should fire, else None. The first sample for a track returns None."""
         st = self._tracks.get(track_id)
         if st is None or (now - st.last_t) > self.forget_after:
             # new or stale track — seed it, can't measure growth yet

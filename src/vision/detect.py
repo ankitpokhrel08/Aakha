@@ -1,27 +1,13 @@
-"""Tier 1 vision — YOLO11n detection, tracking, collision, crosswalk, lights.
+"""Vision pipeline — YOLO11n detection, tracking, collision, crosswalk, lights.
 
-Pipeline per frame: read frame -> YOLO11n (ONNX) detection (+ ByteTrack when
-tracking) -> for each relevant box compute its horizontal zone
-(left / ahead / right) -> publish Events onto the shared bus:
+Per frame: YOLO11n (ONNX) detection (+ ByteTrack when tracking) -> per box
+compute its horizontal zone -> publish Events. Proximity is approximated by
+bbox area (bigger == closer); alerts are debounced to avoid flooding TTS.
 
-  * obstacle      (NORMAL)   nearest object + direction
-  * collision     (CRITICAL) a tracked object looming / gap closing fast
-  * crosswalk     (NORMAL)   zebra stripes detected ahead (Canny + Hough)
-  * traffic_light (NORMAL)   red / amber / green state of a traffic-light box
-
-Proximity is approximated by bbox area (bigger == closer); alerts are debounced
-so we don't flood the TTS queue.
-
-Standalone (run from the repo root):
-    python -m vision.detect                       # default webcam (source 0)
-    python -m vision.detect --source clip.mp4     # a video file
-    python -m vision.detect --source frame.jpg    # a single image
-    python -m vision.detect --save out.mp4        # write annotated video
-    python -m vision.detect --no-show             # console only
-    # toggles: --no-track --no-crosswalk --no-traffic-light --all-classes --no-bus
-
-For integration, main.run() can start `vision_loop(...)` in a thread
-(use show=False there — GUI windows must live on the main thread on macOS).
+Standalone: python -m src.vision.detect [--source clip.mp4|frame.jpg]
+[--save out.mp4] [--no-show] [--no-track --no-crosswalk --no-traffic-light
+--all-classes --no-bus]. main.run() starts vision_loop() in a thread with
+show=False (GUI windows must live on the main thread on macOS).
 """
 from __future__ import annotations
 
@@ -33,51 +19,34 @@ from typing import Callable, Optional
 import cv2
 from ultralytics import YOLO
 
-from shared.bus import event_bus
-from shared.events import Event, Priority
-from vision.collision import CollisionMonitor
-from vision.crosswalk import CrosswalkDetector
-from vision.depth import FreeSpaceMonitor
-from vision.guidance import (
+from src.core.bus import event_bus
+from src.core.events import Event, Priority
+from src.vision.collision import CollisionMonitor
+from src.vision.crosswalk import CrosswalkDetector
+from src.vision.depth import FreeSpaceMonitor
+from src.vision.guidance import (
     DANGER, DANGER_DEFAULT, Candidate, Corridor, GuidanceArbiter, display_name)
-from vision.path import PathGuide, annotate_path
-from vision.traffic_light import (
+from src.vision.path import PathGuide, annotate_path
+from src.vision.traffic_light import (
     TRAFFIC_LIGHT_ID, TrafficLightMonitor, classify_light)
 
-# --- Tier 1 config (kept local; a global settings module is Dev 3's job) ---
 MODEL_PT = "yolo11n.pt"
 MODEL_ONNX = "yolo11n.onnx"
 CONF = 0.35          # detection confidence floor
-IMG_SIZE = 640       # inference / export resolution
-DEBOUNCE_SECONDS = 2.0  # min gap between repeated alerts for the same thing
-# Push mode only: keep the ~2s guidance beat alive across short frame stalls
-# (phone/network jitter) by re-running the arbiter on the last scene. Beyond this
-# many seconds without a fresh frame the feed is considered lost and we go silent
-# rather than speak indefinitely-stale guidance.
+IMG_SIZE = 640
+DEBOUNCE_SECONDS = 2.0
+# Push mode: keep the ~2s beat alive across short frame stalls by re-running the
+# arbiter on the last scene; past this many stale seconds, go silent.
 STALE_SCENE_LIMIT = 4.0
-# B5: objects just OUTSIDE the corridor but within this fraction of frame width
-# beside it are announced with a left/right direction ("person on your left").
-# Wide enough to catch something you'd clip; narrow enough to ignore things across
-# the street. One such cue per beat (LOW), so the anti-flood cadence is unchanged.
+# Objects this fraction of frame width beside the corridor get a left/right cue.
 SIDE_BAND_FRAC = 0.15
-# Clear-path feedback. Live app: speak "path is clear" ONCE when the path becomes
-# clear (a real state transition), then a steady 1 Hz on-track BEEP so the user
-# knows they're still tracked without a repeated phrase (a heartbeat Event the
-# audio consumer renders as a beep, not speech). The beep is a metronome emitted
-# directly (see vision_loop) — it must bypass the guidance arbiter, whose 2s beat
-# would otherwise cap it. Offline tools that synthesise every message as speech
-# instead get a throttled spoken "path is clear" every CLEAR_FILLER_GAP seconds.
-ON_TRACK_BEEP_GAP = 1.0     # seconds between on-track beeps (1 Hz reassurance pulse)
+ON_TRACK_BEEP_GAP = 1.0     # seconds between on-track beeps
 CLEAR_FILLER_GAP = 8.0      # spoken "path is clear" cadence for non-heartbeat callers
 
-# Detect ALL COCO classes: the confident ones are spoken by name, everything
-# else in the path is announced as a generic "object" — so Nepal obstacles that
-# aren't in COCO's vocabulary (carts, rickshaw loads, vendors) still get flagged
-# as "object". The corridor + 2s cadence keep this from flooding. None = all.
+# None = detect all 80 COCO classes; unnamed ones are announced as "object" so
+# out-of-vocabulary obstacles (carts, vendors) still get flagged.
 RELEVANT_CLASS_IDS: Optional[set[int]] = None
-
-# Classes dropped entirely, even as "object" (never relevant in this context).
-SUPPRESSED_CLASS_IDS: set[int] = {6}  # 6 = train
+SUPPRESSED_CLASS_IDS: set[int] = {6}  # 6 = train (never relevant here)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -112,10 +81,8 @@ def phrase_for(name: str, zone: str) -> str:
 
 
 def collision_phrase(name: str, zone: str) -> str:
-    """CRITICAL closing-warning phrase. The trigger is bbox *growth* = the gap is
-    closing, which happens whether the object moves toward the user OR the user
-    walks toward a static object. "approaching" wrongly implied the object was
-    moving; "closing on X" is neutral to who's moving and fits both cases."""
+    """CRITICAL closing-warning phrase. Trigger is bbox growth (gap closing),
+    so "closing on X" stays neutral to whether the object or the user is moving."""
     dirn = "" if zone == "ahead" else f" on your {zone}"
     return f"closing on {name}{dirn}"
 
@@ -257,18 +224,13 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
                       heartbeat=False):
     """Turn this frame's signals into Candidate alerts for the arbiter.
 
-    Obstacles are corridor-filtered: only those whose ground contact (bbox
-    bottom-centre) lies inside the walking corridor can be announced. `blocked`
-    is the monocular-depth free-space verdict (a wall / dead-end YOLO can't see).
-
-    Two corridors: the straight-ahead "X ahead" / collision cue uses the shorter
-    `ahead_corridor` (fires only when something is genuinely near); the side
-    (left/right) cues use the full-length `corridor` (longer reach). If
-    `ahead_corridor` is None it falls back to `corridor` (single-corridor callers).
+    Obstacles are corridor-filtered by ground contact (bbox bottom-centre).
+    `blocked` is the depth free-space verdict (a wall YOLO can't see). The
+    straight-ahead cue uses the shorter `ahead_corridor`; side/path cues use the
+    full `corridor`. `ahead_corridor=None` falls back to `corridor`.
     """
     ahead = ahead_corridor if ahead_corridor is not None else corridor
-    # obstacles standing in the (shorter) straight-ahead corridor (traffic lights
-    # are handled separately by the light detector, not as obstacles)
+    # traffic lights are handled by the light detector, not as obstacles
     in_corr = [d for d in dets
                if d["cls"] != TRAFFIC_LIGHT_ID
                and ahead.contains(d["cx"], d["box"][3], w, h)]
@@ -292,28 +254,20 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
             "obstacle", f"obstacle:{nd['zone']}", 2.0,
             {"class": nd["name"], "zone": nd["zone"]}))
     elif blocked:
-        # corridor is clear of COCO objects but depth says a wall / dead-end is a
-        # few steps ahead (YOLO can't see walls) — warn instead of "path is clear"
+        # corridor clear of objects but depth sees a wall ahead — warn, don't reassure
         cands.append(Candidate(Priority.NORMAL, 1.0, "path blocked", "path_state",
                                "blocked", 3.0, {}))
     elif heartbeat:
-        # live app: a clear path is quiet reassurance, not a repeated phrase.
-        # Speak "path is clear" once on the transition (announce_clear); the steady
-        # 1 Hz on-track beep is emitted directly in vision_loop (it bypasses this
-        # arbiter, whose 2s beat would cap it), so it isn't a candidate here.
+        # live app: speak "path is clear" once on the transition; the steady beep
+        # (emitted directly in vision_loop) covers the ongoing clear state.
         if announce_clear:
             cands.append(Candidate(Priority.LOW, 0.2, "path is clear",
                                    "path_state", "clear", 2.0, {}))
     else:
-        # offline/narration callers (no beep channel): a throttled spoken "path is
-        # clear" reassurance so a clear path still has occasional content
+        # offline callers (no beep channel): throttled spoken "path is clear"
         cands.append(Candidate(Priority.LOW, 0.1, "path is clear", "path_state",
                                "clear", CLEAR_FILLER_GAP, {}))
-    # LOW — side object: nearest thing just left/right of the corridor, near
-    # enough to clip. Advisory only (never overrides an in-path hazard), and we
-    # add at most ONE per frame ranked by proximity*danger, so the arbiter's
-    # one-cue-per-beat cadence keeps this from re-flooding the way the pre-corridor
-    # code did. Its 0.5 urgency beats the "path is clear" filler and path hints.
+    # LOW — one side object just outside the corridor, ranked by proximity*danger
     side = []
     for d in dets:
         if d["cls"] == TRAFFIC_LIGHT_ID:
@@ -370,11 +324,8 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
                  freespace=None, ahead_corridor=None):
     """Draw corridor dividers, boxes+labels, crosswalk stripes, and phrases.
 
-    Collision-alerted tracks are drawn thick red with an APPROACHING tag; the
-    nearest obstacle red; everything else green. Crosswalk stripe edges are
-    yellow, with a banner when a crossing is detected. A traffic-light box is
-    coloured by its lamp state. Path guidance (boundaries + drift cue) is drawn
-    when provided.
+    Collision tracks are thick red, the nearest obstacle red, else green; a
+    traffic-light box is coloured by its lamp state.
     """
     h, w = frame.shape[:2]
     # left | ahead | right corridor boundaries
@@ -395,7 +346,7 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
             if ahead.contains(d["cx"], d["box"][3], w, h):
                 cv2.circle(frame, (gx, gy), 5, (0, 255, 255), -1)   # ahead obstacle
             elif not corridor.contains(d["cx"], d["box"][3], w, h):
-                half = corridor.half_width_at(d["box"][3], w, h)   # side-band (B5):
+                half = corridor.half_width_at(d["box"][3], w, h)   # side-band:
                 if half is not None and \
                         abs(d["cx"] - w / 2.0) <= half + SIDE_BAND_FRAC * w:
                     cv2.circle(frame, (gx, gy), 5, (255, 0, 255), -1)  # "on your L/R"
@@ -455,7 +406,7 @@ def draw_overlay(frame, dets: list[dict], alert_ids: frozenset = frozenset(),
     return frame
 
 
-WINDOW = "Aakha — Tier 1 vision (press q to quit)"
+WINDOW = "Aakha vision (press q to quit)"
 
 
 def _show(frame) -> bool:
@@ -484,27 +435,13 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                 stop_event=None) -> None:
     """Continuous capture loop for live sources (webcam / video).
 
-    With track=True (default) each frame runs ByteTrack (model.track,
-    persist=True) so objects keep stable ids, and a CollisionMonitor turns
-    bbox growth into CRITICAL "closing on X" warnings. Directional (NORMAL)
-    alerts fire in both modes. Crosswalk + traffic-light detection run when
-    enabled.
+    track=True runs ByteTrack for stable ids so the CollisionMonitor can turn
+    bbox growth into CRITICAL warnings.
 
-    Frame source:
-      frames  — optional callable returning the latest BGR frame (or None). When
-                given, frames are *pushed* (e.g. from a phone over the server's
-                /camera websocket) and `source` is ignored; otherwise a local
-                cv2.VideoCapture(source) is opened.
-
-    Integration hooks (used by main.run()):
-      on_frame(frame)      — called each tick with the latest clean BGR frame,
-                             so Tier 3 threads (OCR, voice) can
-                             read it via main.get_latest_frame().
-      on_detections(dets)  — called each tick with the raw detection dicts.
-
-    main.run() can start this in a daemon thread (use show=False there — GUI
-    windows must live on the main thread on macOS). Stops when the source ends,
-    stop_event is set, or the user presses q/ESC in the window.
+    frames: a callable returning the latest BGR frame (push mode, e.g. phone over
+    the /camera websocket); `source` is ignored when given, else a local
+    cv2.VideoCapture(source) is opened. on_frame/on_detections/on_annotated feed
+    main's shared slots. Stops when the source ends, stop_event is set, or q/ESC.
     """
     model = YOLO(ensure_onnx_model())
     cap = None
@@ -546,10 +483,7 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
             else:
                 frame = frames()
                 if frame is None:          # no pushed frame yet — wait briefly
-                    # Sustain the ~2s beat across short frame stalls using the last
-                    # scene, so cadence doesn't stretch to 5-6s on push jitter.
-                    # But not while muted (voice command in progress, or navigation
-                    # paused): don't let a stalled frame replay an ambient cue.
+                    # Sustain the ~2s beat across short stalls, but not while muted.
                     quiet = (voice_active() if voice_active is not None else False) \
                         or (nav_active is not None and not nav_active())
                     if (publish and arbiter is not None and last_cands is not None
@@ -574,14 +508,13 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                                 verbose=False)[0]
             dets = detections_from(results, width, class_ids)
 
-            # Feed the shared frame/detection slots so Tier 2/3 can use them.
+            # Feed the shared frame/detection slots for the OCR/voice threads.
             if on_frame is not None:
                 on_frame(frame)
             if on_detections is not None:
                 on_detections(dets)
-            # hand the frame to the background depth thread (cheap; non-blocking)
             if freespace_mon is not None:
-                freespace_mon.submit(frame)
+                freespace_mon.submit(frame)  # non-blocking, to the depth thread
 
             print(f"[frame {frame_no}]")
             print_dets(dets)
@@ -626,23 +559,15 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
             # --- decide what to say ---
             if publish and arbiter is not None:
                 blocked = freespace_mon.blocked if freespace_mon is not None else False
-                # Guidance is MUTED (no obstacle/side/path/collision cue, no beep)
-                # in two cases:
-                #  - voice command in progress (recording/OCR/"what am I holding"):
-                #    interrupting a command with anything creates chaos (V2); and
-                #  - navigation paused: the app is started and the camera still
-                #    streams (so a command can see the frame), but the user hasn't
-                #    tapped into navigation — guidance should stay silent until they
-                #    do. Muted here at the source, so it stops uniformly on every
-                #    consumer (laptop TTS, dashboard, phone).
+                # Mute all guidance (no cue, no beep) during a voice command or
+                # while navigation is paused. Muting at the source stops it
+                # uniformly on every consumer (laptop TTS, dashboard, phone).
                 voice_on = voice_active() if voice_active is not None else False
                 nav_on = nav_active() if nav_active is not None else True
                 muted = voice_on or not nav_on
-                # transition detect: is the straight-ahead path clear right now?
-                # (no in-ahead-corridor obstacle and no wall). Speak "path is clear"
-                # once per clear run; a beep heartbeat covers the steady clear
-                # state. announce stays pending (sticky) until the arbiter actually
-                # emits it, so a transition landing inside the min_gap isn't lost.
+                # Is the straight-ahead path clear now? Speak "path is clear" once
+                # per clear run; the beep covers the steady state. `announce` stays
+                # sticky until the arbiter emits it, so a transition isn't lost.
                 ahead_clear = not blocked and not any(
                     d["cls"] != TRAFFIC_LIGHT_ID
                     and ahead_corridor.contains(d["cx"], d["box"][3], width, h_)
@@ -657,10 +582,8 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                                                announce_clear=announce_clear,
                                                heartbeat=True)
                 if muted:
-                    # Suspend navigation ENTIRELY — no obstacle/side/path cues and
-                    # no collision either. Clearing the list (vs. calling the
-                    # arbiter) also keeps its cadence/cooldown state untouched, so
-                    # guidance flows normally the instant navigation resumes.
+                    # Clearing the list (vs. calling the arbiter) leaves its
+                    # cadence/cooldown untouched, so guidance resumes cleanly.
                     last_cands = []
                 last_scene_t = now
                 chosen = arbiter.select(last_cands, now)
@@ -670,29 +593,15 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                     if chosen.key == "clear":     # the one-shot actually went out
                         clear_announced = True
 
-                # Steady 1 Hz on-track beep — a non-verbal "the whole near lane is
-                # clear, keep walking" pulse, emitted directly (bypassing the
-                # arbiter's 2s beat) as a heartbeat the consumer renders as a beep.
-                # It must mean *genuinely clear*, so it is suppressed whenever:
-                #   - the depth monitor says the path is blocked (a wall/dead-end),
-                #   - ANYTHING stands in the full walking corridor — including a
-                #     mid-lane object that hasn't yet entered the shorter ahead zone
-                #     we actually speak about (that object gets no candidate, so the
-                #     has_cue check below wouldn't catch it — this is what made the
-                #     beep reassure the user while something sat in their path), or
-                #   - the arbiter has any real cue queued (side object, crosswalk,
-                #     traffic light, path hint); only "path is clear"/blocked
-                #     path_state filler doesn't count.
-                # When it's NOT clear the beep stops and the reason is spoken
-                # ("path blocked", the obstacle/direction cue) so the user turns.
+                # Steady 1 Hz on-track beep, emitted directly (bypassing the
+                # arbiter's 2s beat). It means genuinely clear, so it's suppressed
+                # if depth says blocked, anything stands in the FULL corridor (not
+                # just the shorter ahead zone), any real cue is queued, or muted.
                 in_path = any(
                     d["cls"] != TRAFFIC_LIGHT_ID
                     and corridor.contains(d["cx"], d["box"][3], width, h_)
                     for d in dets)
                 has_cue = any(c.type != "path_state" for c in last_cands)
-                # Hush the metronome while muted (voice command in progress, or
-                # navigation paused) — the beep shouldn't tick then. (`muted`
-                # computed above.)
                 path_clear = not blocked and not in_path and not has_cue and not muted
                 if path_clear and (now - last_beep_t) >= ON_TRACK_BEEP_GAP:
                     event_bus.publish(Event(
@@ -729,7 +638,7 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
                     banner = last_banner if (now - last_banner_t) < 3.0 else ""
                 else:
                     banner = None            # legacy: fall back to nearest phrase
-                # draw on a COPY so the clean frame stored for Tier 2/3 isn't
+                # draw on a copy so the clean frame kept for OCR/voice isn't
                 # polluted with boxes.
                 vis = frame.copy()
                 draw_overlay(vis, dets, alert_ids, crosswalk=xres,
@@ -806,7 +715,7 @@ def run_on_image(path: str, *, publish: bool = True, show: bool = False,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Tier 1 YOLO11n detection")
+    ap = argparse.ArgumentParser(description="YOLO11n detection")
     ap.add_argument("--source", default="0",
                     help="webcam index (0), video file, or image path")
     ap.add_argument("--no-bus", action="store_true",

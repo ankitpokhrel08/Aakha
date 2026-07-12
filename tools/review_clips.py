@@ -1,20 +1,8 @@
-"""B3 — batch-infer the real (Nepal) footage and report what the pipeline does.
+"""Batch-infer a folder of footage and report what the pipeline does.
 
-Runs the FULL Tier-1 pipeline (YOLO detect+track, collision, corridor + arbiter,
-crosswalk, traffic-light, and the monocular-depth wall check) over every clip in a
-folder, and for each clip writes:
-
-  * <clip>_annotated.mp4 — the annotated video, re-encoded to H.264 so it plays
-    in VSCode/QuickTime: YOLO boxes + track ids, the walking corridor, the
-    WALL/free depth readout, crosswalk/traffic-light overlays, and the bottom
-    banner showing what the guidance actually SPOKE at that moment.
-  * an entry in report.md — duration, the detected COCO classes with counts, and
-    the full timeline of spoken guidance (time, priority, message).
-
-This is a validation/review artifact: watch the videos + skim report.md to see how
-the model behaves on real footage (what it detects, what it says, where it's wrong).
-
-Source defaults to assets/real_video, output to assets/real_video_inference.
+Runs the full pipeline over every clip in a folder and writes, per clip, an H.264
+<clip>_annotated.mp4 (boxes, corridor, depth readout, spoken-banner) plus an entry
+in report.md (duration, detected classes with counts, and the spoken timeline).
 
 Usage (from the repo root):
     .venv/bin/python tools/review_clips.py
@@ -32,24 +20,22 @@ import subprocess
 import sys
 import tempfile
 
-# repo root + tools dir on path so `vision`/`shared`/`render_narrated` import
+# repo root + tools dir on path so `src` / `render_narrated` import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cv2  # noqa: E402
 
 import render_narrated as narr  # noqa: E402  (say synth + clip placement + mux)
-from shared.bus import event_bus  # noqa: E402
-from vision import detect  # noqa: E402
+from src.core.bus import event_bus  # noqa: E402
+from src.vision import detect  # noqa: E402
 
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm")
 
 
 def _mux_h264(video: str, audio: str | None, dst: str) -> bool:
-    """Re-encode `video` to H.264 (VSCode/QuickTime-playable) and, if given, mux
-    the narration WAV as AAC audio. OpenCV writes mp4v/mpeg4 that some players
-    won't decode, so we always re-encode. Returns True on success.
-    """
+    """Re-encode `video` to H.264 (OpenCV's mp4v won't play everywhere) and, if
+    given, mux the narration WAV as AAC. Returns True on success."""
     cmd = ["ffmpeg", "-y", "-i", video]
     if audio is not None:
         cmd += ["-i", audio]
@@ -72,8 +58,7 @@ def _narrate(events: list[tuple[float, str, str, str]], dur: float,
     reusing render_narrated's timeline logic. Returns the WAV path, or None."""
     if not events:
         return None
-    # drop 'type', but turn heartbeat events into the on-track beep clip so the
-    # annotated video sounds like the live app (1 Hz Purr while the path is clear)
+    # turn heartbeat events into the on-track beep clip so the video sounds live
     clips = [(t, prio, narr.BEEP_MARKER if typ == "heartbeat" else msg)
              for (t, prio, typ, msg) in events]
     placed = narr._place_clips(clips, workdir)

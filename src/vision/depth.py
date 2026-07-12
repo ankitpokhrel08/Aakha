@@ -1,27 +1,14 @@
-"""Tier 1.5 free-space — monocular-depth wall / dead-end detector (slow thread).
+"""Free-space — monocular-depth wall / dead-end detector (background thread).
 
-YOLO can't see walls: a wall is not a COCO class and has no bounding-box-friendly
-features, so an empty corridor is wrongly announced as "path is clear" even when a
-wall is right in front of you. This module supplies the missing signal.
+YOLO can't see walls (not a COCO class), so an empty corridor is wrongly called
+"path is clear". Depth Anything V2-small (ONNX) estimates relative depth on a
+background thread at ~5 fps. Verdict = near_fraction(): how much of the "a few
+steps ahead" band is as near as the ground at your feet (~0 open, 0.2-0.5 wall),
+smoothed with EMA + hysteresis. Glass is a known weak spot for all passive
+vision, so treat it as best-effort.
 
-Depth Anything V2-small (ONNX) estimates *relative* depth (larger = nearer). We run
-it on a BACKGROUND THREAD at ~5 fps on a downscaled frame so it never blocks Tier 1.
-The verdict:
-
-  near-fraction — within the central corridor column, the fraction of the "a few
-  steps ahead" band whose depth is as near as the 40th percentile of the "at your
-  feet" band. Open ground recedes with perspective -> ~0.0; a fronto-parallel wall
-  a few steps ahead is as close as your feet -> 0.2-0.5.
-
-Smoothed with an EMA + hysteresis so a single noisy frame never fires. Calibrated
-on assets/wall/*: every OPEN clip reads a flat 0.00 (no false alarms); all four
-wall clips (including two GLASS walls) exceed the 0.15 on-threshold. Glass is a
-known weak spot for ALL passive vision (depth partly sees through it) — treat a
-glass wall as best-effort, not guaranteed.
-
-Degrades gracefully: if onnxruntime or the model file is absent, the monitor stays
-disabled (`blocked` is always False, `available` is False) and the pipeline runs
-exactly as it did before — so the smoke test and teammate machines are unaffected.
+Degrades gracefully: without onnxruntime or the model, `available` is False and
+`blocked` stays False, so the pipeline runs exactly as before.
 """
 from __future__ import annotations
 
@@ -35,8 +22,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# Depth Anything V2-small, ONNX (onnx-community/depth-anything-v2-small, *.onnx is
-# gitignored — downloaded per machine on first run, like yolo11n.onnx).
+# Depth Anything V2-small ONNX; gitignored, downloaded per machine on first run.
 MODEL_ONNX = "depth_anything_v2_vits.onnx"
 MODEL_URL = ("https://huggingface.co/onnx-community/depth-anything-v2-small/"
              "resolve/main/onnx/model.onnx")
@@ -48,21 +34,15 @@ _STD = np.array([0.229, 0.224, 0.225], np.float32)
 ON_THRESHOLD = 0.15              # EMA >= this -> blocked
 OFF_THRESHOLD = 0.07             # EMA <= this -> clear again (hysteresis)
 TARGET_FPS = 5.0                 # background inference cadence
-# Time-constant EMA: alpha = 1 - exp(-dt/TAU). Using a wall-/video-time constant
-# (not a fixed per-sample alpha) makes the smoothing rate-INDEPENDENT, so the wall
-# verdict fires at the same moment whether depth samples at 2, 3 or 5 Hz (a fixed
-# alpha mis-fires at the "unlucky middle" rates, and the live rate drifts with CPU
-# load). TAU=0.46s reproduces the old alpha=0.35 @5Hz, preserving calibration.
+# Time-constant EMA (alpha = 1 - exp(-dt/TAU)): rate-independent smoothing so the
+# verdict fires at the same moment whether depth samples at 2, 3 or 5 Hz.
 TAU = 0.46
-EMA_ALPHA = 0.35                 # (legacy; used by the per-frame overlay tool)
+EMA_ALPHA = 0.35                 # legacy; used by the per-frame overlay tool
 
 
 def ensure_depth_model(path: str = MODEL_ONNX, url: str = MODEL_URL) -> str:
-    """Return a path to the depth ONNX, downloading it once (~94 MB) if absent.
-
-    Mirrors vision.detect.ensure_onnx_model for YOLO: weights are per-machine and
-    gitignored. Raises on a failed download so the caller can degrade gracefully.
-    """
+    """Return the depth ONNX path, downloading it once (~94 MB) if absent.
+    Raises on a failed download so the caller can degrade gracefully."""
     if not Path(path).exists():
         print(f"[depth] downloading {path} (~94 MB, one-time)...")
         urllib.request.urlretrieve(url, path)
@@ -71,20 +51,17 @@ def ensure_depth_model(path: str = MODEL_ONNX, url: str = MODEL_URL) -> str:
 
 
 class DepthEstimator:
-    """Thin onnxruntime wrapper around Depth Anything V2-small.
-
-    Lazily builds the session; if onnxruntime or the model file is missing it
-    raises at construction so the caller can fall back to a disabled monitor.
-    """
+    """onnxruntime wrapper around Depth Anything V2-small. Raises at construction
+    if onnxruntime or the model is missing, so the caller can disable the monitor."""
 
     def __init__(self, model_path: str = MODEL_ONNX, size: int = INPUT_SIZE) -> None:
-        import onnxruntime as ort            # local import: optional dependency
+        import onnxruntime as ort            # optional dependency
 
-        ensure_depth_model(model_path)        # download once if missing
+        ensure_depth_model(model_path)
         so = ort.SessionOptions()
-        so.intra_op_num_threads = 2          # be polite to Tier 1's YOLO session
-        # CPU beats CoreML here — the graph fragments into ~100 CoreML partitions
-        # and ping-pongs, running ~5x slower than plain CPU. Measured on M2.
+        so.intra_op_num_threads = 2          # be polite to the YOLO session
+        # CPU beats CoreML here (the graph fragments into ~100 partitions, ~5x
+        # slower). Measured on M2.
         self.session = ort.InferenceSession(
             model_path, so, providers=["CPUExecutionProvider"])
         self.size = size
