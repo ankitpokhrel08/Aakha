@@ -44,7 +44,7 @@ _BEEP_SOUND = os.path.join(_REPO_ROOT, "sound_asset", "Purr.mp3")
 # of depending on the phone's (differently-timed) TTS to signal "done". Mirrors
 # the phone client's REPLY_TERMINAL set.
 _VOICE_REPLY_TERMINAL = {"ocr", "held_object", "voice_no_match",
-                         "voice_error", "caption"}
+                         "voice_error"}
 
 
 def _voice_active() -> bool:
@@ -167,12 +167,12 @@ if __name__ == "__main__":
     time.sleep(0.5)  # give the engine a moment to init before first event arrives
 
     print("Publishing LOW → NORMAL → CRITICAL (should be spoken in reverse priority order)...")
-    event_bus.publish(Event("Scene caption: a corridor ahead", Priority.LOW, "caption", "scene"))
+    event_bus.publish(Event("Text reads: exit ahead", Priority.LOW, "ocr", "ocr"))
     # time.sleep(0.05)
     event_bus.publish(Event("Obstacle ahead", Priority.NORMAL, "obstacle", "vision"))
     time.sleep(0.05)
     event_bus.publish(Event("Warning: object approaching fast", Priority.CRITICAL, "collision", "vision"))
-    event_bus.publish(Event("Scene caption: a corridor ahead", Priority.LOW, "caption", "scene"))
+    event_bus.publish(Event("Text reads: exit ahead", Priority.LOW, "ocr", "ocr"))
     # time.sleep(0.05)
     event_bus.publish(Event("Obstacle ahead", Priority.NORMAL, "obstacle", "vision"))
     

@@ -1,15 +1,14 @@
-"""Tier 3 — One-shot Vosk transcription + 4-command keyword dispatch.
+"""Tier 3 — One-shot Vosk transcription + 3-command keyword dispatch.
 
 Updated scope (per PROGRESS.md):
   Wake-word continuous listening is CUT. Instead, Dev 3 sends a short WAV
   clip over WiFi when the user presses the volume button on their phone.
   This module receives that clip (as raw bytes or a file path), runs Vosk
-  on it, matches against 4 fixed phrases, and dispatches the right action.
+  on it, matches against 3 fixed phrases, and dispatches the right action.
 
-The 4 commands and their actions:
+The 3 commands and their actions:
   "what am I holding"  → most prominent object over a ~2 s scan → publish
   "read this"          → trigger OCR on current frame → publish
-  "describe the scene" → trigger Moondream2 caption on demand → publish
   "repeat that"        → re-speak last TTS message → publish type="repeat"
 
 Public API:
@@ -17,7 +16,7 @@ Public API:
         Run Vosk on raw 16kHz mono PCM bytes; return transcribed text.
 
     dispatch_command(transcript: str, get_frame, get_detections=None) -> None
-        Match transcript to the 4 commands and publish the right Event(s).
+        Match transcript to the 3 commands and publish the right Event(s).
 
     start_voice_trigger_thread(get_frame, get_detections=None) -> threading.Thread
         Background thread that monitors a shared clip queue. Dev 3 drops
@@ -67,8 +66,7 @@ _DEFAULT_MODEL_PATH = os.path.join(
 # people phrase the same intent many ways, so instead of one exact word we match
 # a SET of regex patterns per command — word STEMS (\bhold catches hold/holding/
 # holds), synonyms, and whole natural phrases. If ANY pattern is found anywhere in
-# the transcript the command fires. First command with a hit wins, so the broadest
-# one (describe) is checked LAST to avoid it hijacking a more specific intent.
+# the transcript the command fires. First command with a hit wins.
 # It's just re.search on a short string — microseconds, well within real-time.
 # ---------------------------------------------------------------------------
 _COMMAND_PATTERNS = [
@@ -94,15 +92,6 @@ _COMMAND_PATTERNS = [
         r"what did you say",
         r"one more time",
         r"\bpardon\b",
-    ]),
-    ("describe", [                       # broadest — checked last
-        r"\bdescrib",                   # describe, describing, description
-        r"\bscene\b",
-        r"\bsurrounding",
-        r"around me",
-        r"what.*(around|in front|ahead|is there)",
-        r"(what|tell).*(you see|do you see)",
-        r"\blook around",
     ]),
 ]
 
@@ -153,7 +142,7 @@ def _match_command(transcript: str) -> Optional[str]:
     """Return the command key whose patterns first match the transcript, or None.
 
     Robust to Vosk mis-hearings and phrasing: any one matching pattern fires the
-    command (see _COMMAND_PATTERNS). Broadest command checked last.
+    command (see _COMMAND_PATTERNS).
     """
     t = transcript.lower().strip()
     if not t:
@@ -257,7 +246,7 @@ def dispatch_command(
         else:
             print("[voice_trigger] No command matched.")
             message = ("I didn't understand. You can say: what am I holding, "
-                       "read this, describe the scene, or repeat that.")
+                       "read this, or repeat that.")
         event_bus.publish(Event(
             message=message,
             priority=Priority.NORMAL,
@@ -295,18 +284,6 @@ def dispatch_command(
             message=message,
             priority=Priority.NORMAL,
             type="ocr",
-            source="voice",
-        ))
-
-    elif cmd == "describe":
-        # Trigger Moondream2 caption on demand by clearing the cooldown.
-        # scene_caption thread will pick it up on its next wake cycle.
-        import visuals.scene_caption as sc
-        sc._last_caption_requested = True  # sentinel checked in scene_caption
-        event_bus.publish(Event(
-            message="Describing the scene now.",
-            priority=Priority.NORMAL,
-            type="caption_request",
             source="voice",
         ))
 
@@ -381,7 +358,7 @@ def start_voice_trigger_thread(
     """Start the voice-trigger daemon thread and return it.
 
     Args:
-        get_frame:       Latest BGR frame callable (same as scene_caption).
+        get_frame:       Latest BGR frame callable (main.get_latest_frame).
         get_detections:  Optional callable returning Tier 1 YOLO detections
                          [{"label": str, "bbox": (x1,y1,x2,y2)}, ...].
                          Pass None until dev1/detection merges.
@@ -427,7 +404,7 @@ if __name__ == "__main__":
     def _fake_frame():
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    for phrase in ["repeat that", "read this", "describe the scene"]:
+    for phrase in ["repeat that", "read this", "what am I holding"]:
         print(f"\n[test] Dispatching: {phrase!r}")
         dispatch_command(phrase, _fake_frame, get_detections=None)
         time.sleep(4)

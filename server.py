@@ -723,22 +723,22 @@ navigation</button>
 
   // --- on-device TTS: speak spoken-type bus events (phone is the voice) ---
   const SPEAK = new Set(["obstacle","collision","crosswalk","traffic_light","path",
-    "path_drift","ocr","caption","held_object","voice_no_match","voice_heard","control",
-    "caption_request","voice_error"]);
+    "path_drift","ocr","held_object","voice_no_match","voice_heard","control",
+    "voice_error"]);
   // Events that speak even when navigation is OFF: on/off confirmations and
   // user-requested voice responses (the command is explicit, so echo/answer it).
-  // caption_request = "describing the scene now" ack; voice_error = command failed.
+  // voice_error = command failed.
   const ALWAYS_SPEAK = new Set(["control","voice_heard","voice_no_match","ocr",
-    "held_object","caption_request","voice_error"]);
+    "held_object","voice_error"]);
   // Replies to an explicit voice command. During a voice session these are the
   // only things spoken; ambient guidance is paused so the answer is heard clean.
   const REPLY = new Set(["ocr","held_object","voice_no_match","voice_error",
-    "caption","caption_request","voice_heard"]);
+    "voice_heard"]);
   // A reply that ENDS the voice session once it finishes speaking (guidance then
-  // resumes). caption_request/voice_heard are spoken but keep the session open
-  // (they're acks — the real answer is still coming).
+  // resumes). voice_heard is spoken but keeps the session open (it's an ack —
+  // the real answer is still coming).
   const REPLY_TERMINAL = new Set(["ocr","held_object","voice_no_match",
-    "voice_error","caption"]);
+    "voice_error"]);
   // On-track heartbeat beep — the phone is the speaker (mirrors the laptop's
   // afplay beep). Unlocked on the first tap below (iOS needs a user gesture).
   const beep = new Audio("/beep.mp3"); beep.preload = "auto";

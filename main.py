@@ -3,12 +3,11 @@
 Thread layout after Dev 2 merges:
   _vision_producer  — Tier 1 stub (dev1/detection will replace this)
   _audio_consumer   — pyttsx3 priority-queue consumer (audio/consumer.py)
-  _scene_caption    — Moondream2 background captioning (visuals/scene_caption.py)
   _ocr              — Tesseract on Enter keypress (visuals/ocr.py)
   _voice_trigger    — Vosk wake-word + MediaPipe Hands (audio/voice_trigger.py)
 
 Shared frame slot:
-  The scene-caption, OCR, and voice-trigger threads call ``get_latest_frame()``,
+  The OCR and voice-trigger threads call ``get_latest_frame()``,
   which reads a BGR numpy array written by the vision thread. Until dev1/detection
   merges the stub leaves it None, so those threads idle without processing.
   When dev1 merges, its loop should call ``set_latest_frame(frame)`` each tick.
@@ -255,7 +254,6 @@ def start_workers() -> list[threading.Thread]:
     from audio.consumer import start_consumer
     from audio.voice_trigger import start_voice_trigger_thread
     from visuals.ocr import start_ocr_thread
-    from visuals.scene_caption import start_scene_caption_thread
 
     WORKER_THREADS.clear()
 
@@ -269,9 +267,6 @@ def start_workers() -> list[threading.Thread]:
 
     # Tier 2 audio consumer.
     WORKER_THREADS.append(start_consumer())
-
-    # Tier 2 scene captioning (idles gracefully when get_latest_frame() → None).
-    WORKER_THREADS.append(start_scene_caption_thread(get_latest_frame))
 
     # Tier 3 OCR — triggered by pressing Enter; idles when no frame available.
     WORKER_THREADS.append(start_ocr_thread(get_latest_frame))

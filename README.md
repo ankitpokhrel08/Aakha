@@ -35,9 +35,6 @@ curl -L -o /tmp/vosk.zip https://alphacephei.com/vosk/models/vosk-model-small-en
 unzip -q /tmp/vosk.zip -d .   # -> ./vosk-model-small-en-us-0.15/
 ```
 
-Moondream2 (Tier 2 scene captioning) downloads itself on first run. It is optional;
-the core loop runs without it and idles if it can't load.
-
 ## Run
 
 Two terminals. Pipeline + web server:
@@ -78,7 +75,6 @@ the examples (and close variants) work.
 |---|---|---|
 | Read | OCR the current frame aloud | "read this", "read the text", "what does this say" |
 | What am I holding | Names the object held up to the camera | "what am I holding", "what's in my hand", "what is this object" |
-| Describe the scene | Moondream2 caption, if loaded | "describe the scene", "what's around me", "what's in front", "look around" |
 | Repeat | Re-speaks the last line | "repeat that", "say again", "one more time" |
 
 Heard nothing: "I didn't catch that". Heard speech but no known command: reads back

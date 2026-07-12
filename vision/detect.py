@@ -498,7 +498,7 @@ def vision_loop(source=0, *, publish: bool = True, show: bool = False,
 
     Integration hooks (used by main.run()):
       on_frame(frame)      — called each tick with the latest clean BGR frame,
-                             so Tier 2/3 threads (scene caption, OCR, voice) can
+                             so Tier 3 threads (OCR, voice) can
                              read it via main.get_latest_frame().
       on_detections(dets)  — called each tick with the raw detection dicts.
 
