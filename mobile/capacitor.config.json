@@ -1,0 +1,8 @@
+{
+  "appId": "com.aakha.app",
+  "appName": "Aakha",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  }
+}

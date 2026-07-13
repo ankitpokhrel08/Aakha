@@ -647,9 +647,9 @@ navigation</button>
   const getAudio = connect("/audio");
 
   // --- on-device TTS: speak spoken-type bus events (phone is the voice) ---
-  const SPEAK = new Set(["obstacle","collision","crosswalk","traffic_light","path",
-    "path_drift","ocr","held_object","voice_no_match","voice_heard","control",
-    "voice_error"]);
+  const SPEAK = new Set(["obstacle","obstacle_side","collision","crosswalk",
+    "traffic_light","path","path_state","path_drift","ocr","held_object",
+    "voice_no_match","voice_heard","control","voice_error"]);
   // Events that speak even when navigation is OFF: on/off confirmations and
   // user-requested voice responses (the command is explicit, so echo/answer it).
   // voice_error = command failed.

@@ -34,6 +34,12 @@ MODEL_PT = "yolo11n.pt"
 MODEL_ONNX = "yolo11n.onnx"
 CONF = 0.35          # detection confidence floor
 IMG_SIZE = 640
+# Ambient guidance only names a "daily" (non-priority) object if its confidence
+# clears this higher bar, so a fleeting low-confidence "cat" isn't announced.
+# Vehicles + person keep the CONF floor (they matter for safety). The voice
+# "what is this?" scan is unaffected — it uses the raw detections.
+PRIORITY_CLASSES = {"person", "bicycle", "motorcycle", "car", "bus", "truck", "train"}
+AMBIENT_MIN_CONF = 0.70
 DEBOUNCE_SECONDS = 2.0
 # Push mode: keep the ~2s beat alive across short frame stalls by re-running the
 # arbiter on the last scene; past this many stale seconds, go silent.
@@ -219,6 +225,12 @@ def announce_traffic_lights(frame, dets: list[dict],
                 data={"state": ann, "id": d["id"]}))
 
 
+def _announceable(d) -> bool:
+    """Ambient naming gate: vehicles/person at the CONF floor; daily objects need
+    AMBIENT_MIN_CONF so a low-confidence detection isn't spoken."""
+    return d["name"] in PRIORITY_CLASSES or d.get("conf", 1.0) >= AMBIENT_MIN_CONF
+
+
 def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs,
                       blocked=False, ahead_corridor=None, announce_clear=False,
                       heartbeat=False):
@@ -244,9 +256,12 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
                 collision_phrase(display_name(d['name']), d['zone']), "collision",
                 f"collision:{d['id']}", 3.0,
                 {"class": d["name"], "id": d["id"], "growth_per_sec": round(g, 2)}))
-    # NORMAL — the single most-pressing in-corridor obstacle (closeness * danger)
-    if in_corr:
-        nd = max(in_corr, key=lambda d: (d["box"][3] / h)
+    # NORMAL — the single most-pressing in-corridor obstacle (closeness * danger).
+    # Daily objects must clear AMBIENT_MIN_CONF; if only low-confidence ones are
+    # ahead, the corridor is treated as nameably clear (blocked/clear applies).
+    named = [d for d in in_corr if _announceable(d)]
+    if named:
+        nd = max(named, key=lambda d: (d["box"][3] / h)
                  * DANGER.get(d["name"], DANGER_DEFAULT))
         urg = (nd["box"][3] / h) * DANGER.get(nd["name"], DANGER_DEFAULT)
         cands.append(Candidate(
@@ -279,8 +294,9 @@ def _build_candidates(dets, corridor, w, h, growths, xres, light_anns, path_msgs
             continue
         if abs(d["cx"] - w / 2.0) <= half + SIDE_BAND_FRAC * w:
             side.append(d)
-    if side:
-        sd = max(side, key=lambda d: (d["box"][3] / h)
+    named_side = [d for d in side if _announceable(d)]
+    if named_side:
+        sd = max(named_side, key=lambda d: (d["box"][3] / h)
                  * DANGER.get(d["name"], DANGER_DEFAULT))
         side_zone = "left" if sd["cx"] < w / 2.0 else "right"
         cands.append(Candidate(

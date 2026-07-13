@@ -1,4 +1,4 @@
-# Aakha — assistive navigation stack.
+# Aakha: assistive navigation stack.
 # Pinned against a Python 3.12 venv on macOS arm64 (Apple Silicon).
 #
 #   python3.12 -m venv .venv
@@ -30,14 +30,16 @@ pyttsx3==2.99                # offline TTS (NSSpeechSynthesizer on macOS)
 fastapi==0.121.2             # WS endpoints (/camera, /status, /control) + pages
 uvicorn[standard]==0.40.0    # ASGI server; [standard] pulls websockets + uvloop
 
-# --- Tier 2: scene captioning (Moondream2) — CUT from the MVP ---
+# --- Tier 2: scene captioning (Moondream2), CUT from the MVP ---
 # Was visuals/scene_caption.py (Moondream2 via transformers). Dropped: ~3.7GB
 # first-run download and ~2-4s inference, never verified against Tier 1 FPS.
 # To restore, re-add `transformers==4.52.4` and `einops==0.8.2` here.
 
 # --- Tier 3: OCR + voice trigger ("what am I holding") ---
-ocrmac==1.0.1                # Apple Vision OCR wrapper (pulls pyobjc-framework-Vision).
-#                              Replaces Tesseract (garbled output) and PaddleOCR
-#                              (paddlepaddle 2.6.2 deadlocks on Apple Silicon).
+ocrmac==1.0.1; sys_platform == "darwin"   # Apple Vision OCR (pulls pyobjc-framework-Vision).
+#                              macOS-only. pip SKIPS it off macOS (the marker), and
+#                              src/vision/ocr.py self-disables OCR when the import
+#                              fails, so `pip install -r requirements.txt` and the
+#                              pipeline both keep working on Linux/Windows (no OCR).
+#                              Replaces Tesseract (garbled) and PaddleOCR (arm64 deadlock).
 vosk==0.3.44                 # offline wake/command speech recognition
-mediapipe==0.10.35           # hand landmarks to locate the held object

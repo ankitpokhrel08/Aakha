@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Aakha</string>
+    <string name="title_activity_main">Aakha</string>
+    <string name="package_name">com.aakha.app</string>
+    <string name="custom_url_scheme">com.aakha.app</string>
+</resources>

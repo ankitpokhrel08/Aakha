@@ -171,8 +171,8 @@ def _scan_held_object(get_frame, get_detections,
         time.sleep(_HOLD_SAMPLE_GAP)
 
     if not votes:
-        return "I don't see anything you might be holding. Hold it up to the camera."
-    return f"You are probably holding a {votes.most_common(1)[0][0]}."
+        return "I don't see anything clearly. Point the camera at it."
+    return f"In front of you is a {votes.most_common(1)[0][0]}."
 
 
 def dispatch_command(
@@ -246,7 +246,7 @@ def dispatch_command(
             message = _scan_held_object(get_frame, get_detections)
         except Exception as e:
             print(f"[voice_trigger] holding scan error: {e}")
-            message = "Could not check what you are holding."
+            message = "Could not identify what is in front of you."
         event_bus.publish(Event(
             message=message,
             priority=Priority.NORMAL,

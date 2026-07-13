@@ -37,3 +37,6 @@ assets
 
 # Vosk model zip and extracted folder
 vosk-model-*
+
+# run.sh output
+logs/

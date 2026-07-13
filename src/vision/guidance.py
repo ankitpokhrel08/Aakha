@@ -24,8 +24,9 @@ DANGER = {
 DANGER_DEFAULT = 0.8
 
 # Classes named in speech; anything else is spoken as a generic "object".
-SPEAK_BY_NAME = {"person", "bicycle", "motorcycle", "car", "bus", "truck",
-                 "dog", "cat"}
+SPEAK_BY_NAME = {"person", "bicycle", "motorcycle", "car", "bus", "truck", "train",
+                 "dog", "cat", "bench", "chair", "potted plant", "fire hydrant",
+                 "stop sign", "parking meter", "backpack", "suitcase", "umbrella"}
 
 
 def display_name(name: str) -> str:

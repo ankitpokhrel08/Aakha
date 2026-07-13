@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Aakha</title>
+<meta name="theme-color" content="#101418" />
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #tap {
+    position: fixed; inset: 0; width: 100vw; height: 100vh;
+    border: none; color: #fff; font: 700 8vw/1.2 system-ui, sans-serif;
+    background: #101418; display: flex; align-items: center; justify-content: center;
+    text-align: center; white-space: pre-line; -webkit-tap-highlight-color: transparent;
+    touch-action: none; user-select: none;
+  }
+  #tap.active { background: #0b3d2e; }
+  #tap.rec { background: #3d1f1f; }
+  #tap:focus-visible { outline: 6px solid #4c8dff; outline-offset: -12px; }
+  #hint { position: fixed; left: 0; right: 0; bottom: env(safe-area-inset-bottom, 12px);
+    color: #9aa4ad; font: 500 3.5vw system-ui, sans-serif; text-align: center; pointer-events: none; }
+  #gear { position: fixed; top: env(safe-area-inset-top, 10px); right: 12px; z-index: 5;
+    background: rgba(0,0,0,.35); color: #cfd6dd; border: none; border-radius: 8px;
+    font: 600 5vw system-ui, sans-serif; width: 12vw; height: 12vw; }
+  #setup { position: fixed; inset: 0; z-index: 10; background: #101418; color: #e6edf3;
+    display: none; align-items: center; justify-content: center; padding: 24px; }
+  #setup.show { display: flex; }
+  #setup .card { width: 100%; max-width: 420px; }
+  #setup h1 { font: 700 6vw/1.2 system-ui, sans-serif; margin: 0 0 8px; }
+  #setup p { color: #9aa4ad; font: 400 4vw/1.4 system-ui, sans-serif; margin: 0 0 16px; }
+  #setup input { width: 100%; box-sizing: border-box; padding: 14px; font-size: 16px;
+    border-radius: 10px; border: 1px solid #2a333c; background: #0b0e11; color: #e6edf3; }
+  #setup button { width: 100%; margin-top: 14px; padding: 16px; font: 700 4.5vw system-ui, sans-serif;
+    border: none; border-radius: 10px; background: #2e7d5b; color: #fff; }
+  #setup video { display: block; width: 100%; aspect-ratio: 3 / 4; object-fit: cover;
+    background: #000; border-radius: 12px; border: 1px solid #2a333c; }
+  #setup .link { background: none; color: #6ea8fe; border: none; padding: 12px 0 0;
+    font: 500 4vw system-ui, sans-serif; width: 100%; margin-top: 0; }
+  #manual { margin-top: 8px; }
+  video, canvas { display: none; }
+</style>
+</head>
+<body>
+  <div id="setup">
+    <div class="card">
+      <h1>Scan to connect</h1>
+      <p id="scanmsg">Point the camera at the QR code on the laptop.</p>
+      <video id="scanv" playsinline muted autoplay></video>
+      <button id="manualBtn" class="link">Enter URL manually</button>
+      <div id="manual" hidden>
+        <input id="srv" type="url" inputmode="url" autocapitalize="off" autocomplete="off"
+               spellcheck="false" placeholder="e.g. abcd-1234.trycloudflare.com" />
+        <button id="save">Save and connect</button>
+      </div>
+    </div>
+  </div>
+  <canvas id="scanc"></canvas>
+
+  <button id="gear" aria-label="Change server URL">⚙</button>
+  <button id="tap" aria-label="Touch to start or resume navigation. Press and hold to speak a command.">Touch to start
+navigation</button>
+  <div id="hint" aria-hidden="true">camera: connecting…</div>
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="c"></canvas>
+<script src="jsQR.js"></script>
+<script>
+(function () {
+  // --- server config: the laptop tunnel host, saved on-device (changes per run) ---
+  function normBase(s) {
+    return (s || "").trim().replace(/^wss?:\/\//, "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  }
+  let SERVER_BASE = normBase(localStorage.getItem("aakha_server") || "");
+  const wsBase = () => "wss://" + SERVER_BASE;      // tunnel is always HTTPS/WSS
+  const httpBase = () => "https://" + SERVER_BASE;
+
+  const setup = document.getElementById("setup");
+  const srvInput = document.getElementById("srv");
+  const scanV = document.getElementById("scanv");
+  const scanC = document.getElementById("scanc");
+  const scanCtx = scanC.getContext("2d", { willReadFrequently: true });
+  const scanMsg = document.getElementById("scanmsg");
+
+  function hostOk(s) { return /^[a-z0-9.-]+\.[a-z]{2,}(:\d+)?$/i.test(s); }
+  function saveServer(host) {
+    stopScanner();
+    localStorage.setItem("aakha_server", host);
+    if (navigator.vibrate) navigator.vibrate(60);
+    location.reload();   // re-run with the new base so every socket connects
+  }
+  function showManual() { document.getElementById("manual").hidden = false; srvInput.focus(); }
+
+  // First screen: scan the QR that run.sh prints on the laptop (jsQR, rear camera).
+  // The QR holds the tunnel URL; normBase() reduces it to the host we store.
+  let scanStream = null, scanRAF = null;
+  async function startScanner() {
+    if (scanStream) return;
+    try {
+      scanStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } }, audio: false });
+      scanV.srcObject = scanStream; await scanV.play();
+      scanLoop();
+    } catch (err) {
+      scanMsg.textContent = "camera blocked (" + err.name + ") — type the URL below.";
+      showManual();
+    }
+  }
+  function stopScanner() {
+    if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = null; }
+    if (scanStream) { scanStream.getTracks().forEach((t) => t.stop()); scanStream = null; }
+  }
+  function scanLoop() {
+    scanRAF = requestAnimationFrame(scanLoop);
+    if (!scanV.videoWidth) return;
+    scanC.width = scanV.videoWidth; scanC.height = scanV.videoHeight;
+    scanCtx.drawImage(scanV, 0, 0, scanC.width, scanC.height);
+    let img; try { img = scanCtx.getImageData(0, 0, scanC.width, scanC.height); } catch (_) { return; }
+    const code = window.jsQR && window.jsQR(img.data, img.width, img.height, { inversionAttempts: "dontInvert" });
+    if (!code || !code.data) return;
+    const host = normBase(code.data);
+    if (!hostOk(host)) { scanMsg.textContent = "that QR isn't a server URL — try again."; return; }
+    saveServer(host);
+  }
+
+  document.getElementById("gear").addEventListener("click", () => showSetup());
+  document.getElementById("manualBtn").addEventListener("click", showManual);
+  document.getElementById("save").addEventListener("click", () => {
+    const v = normBase(srvInput.value);
+    if (!v) { srvInput.focus(); return; }
+    saveServer(v);
+  });
+  function showSetup() {
+    setup.classList.add("show");
+    srvInput.value = SERVER_BASE;
+    startScanner();
+  }
+  if (!SERVER_BASE) { showSetup(); return; }   // first launch: scan before anything
+
+  const OPEN = 1; // WebSocket.OPEN
+  const btn = document.getElementById("tap");
+  const hint = document.getElementById("hint");
+  const video = document.getElementById("v");
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const FPS = 12, JPEG_Q = 0.6, MAX_W = 640;
+
+  // --- resilient websocket helper (returns a getter for the live socket) ---
+  function connect(path, onmessage) {
+    let ws;
+    const open = () => {
+      ws = new WebSocket(wsBase() + path);
+      ws.binaryType = "arraybuffer";
+      ws.onmessage = (e) => onmessage && onmessage(e);
+      ws.onclose = () => setTimeout(open, 1000);
+      ws.onerror = () => { try { ws.close(); } catch (_) {} };
+    };
+    open();
+    return () => ws;
+  }
+
+  const getControl = connect("/control", (e) => {
+    try { const r = JSON.parse(e.data); if (typeof r.active === "boolean") setActive(r.active); } catch (_) {}
+  });
+  const getCamera = connect("/camera");
+  const getAudio = connect("/audio");
+
+  // --- on-device TTS: speak spoken-type bus events (phone is the voice) ---
+  const SPEAK = new Set(["obstacle","obstacle_side","collision","crosswalk",
+    "traffic_light","path","path_state","path_drift","ocr","held_object",
+    "voice_no_match","voice_heard","control","voice_error"]);
+  const ALWAYS_SPEAK = new Set(["control","voice_heard","voice_no_match","ocr",
+    "held_object","voice_error"]);
+  const REPLY = new Set(["ocr","held_object","voice_no_match","voice_error",
+    "voice_heard"]);
+  const REPLY_TERMINAL = new Set(["ocr","held_object","voice_no_match",
+    "voice_error"]);
+  const beep = new Audio(httpBase() + "/beep.mp3"); beep.preload = "auto";
+  function playBeep() {
+    try { beep.currentTime = 0; beep.play().catch(() => {}); } catch (_) {}
+  }
+
+  // Speech: the Android System WebView has no working Web Speech engine
+  // (SpeechSynthesisUtterance is silently dropped), so speak through the laptop's
+  // /tts synth played as HTML5 audio — the same channel as the beep. `voice` is a
+  // 1-deep freshest-cue queue: an ambient cue that lands mid-clip is held and
+  // played back-to-back (continuous, never stale); CRITICAL/replies interrupt.
+  const voice = new Audio(); voice.preload = "auto";
+  let voiceBusy = false, voicePending = null;
+  function speakAudio(text, interrupt, onEnd) {
+    if (interrupt) { try { voice.pause(); } catch (_) {} }
+    voiceBusy = true;
+    const done = () => {
+      voiceBusy = false;
+      if (onEnd) onEnd();
+      if (voicePending) { const nx = voicePending; voicePending = null; speakAudio(nx.text, false, nx.onEnd); }
+    };
+    voice.onended = done; voice.onerror = done;
+    voice.src = httpBase() + "/tts?text=" + encodeURIComponent(text);
+    voice.play().catch(done);
+  }
+  function stopSpeech() { try { voice.pause(); } catch (_) {} voicePending = null; }
+
+  connect("/status", (e) => {
+    let p; try { p = JSON.parse(e.data); } catch (_) { return; }
+    if (p.kind !== "event") return;
+    if (p.type === "heartbeat") { if (active) playBeep(); return; }
+    if (!p.message || !SPEAK.has(p.type)) return;
+    const isReply = REPLY.has(p.type) || p.type === "control";
+    if (voiceActive && !isReply && p.priority_name !== "CRITICAL") return;
+    if (!voiceActive && !active && !ALWAYS_SPEAK.has(p.type)) return;
+    const critical = p.priority_name === "CRITICAL";
+    const terminal = voiceActive && REPLY_TERMINAL.has(p.type);
+    const onEnd = terminal ? endVoiceMode : null;   // terminal reply resumes guidance
+    if (terminal && voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; }
+    // Ambient cue while something is already speaking: hold only the freshest,
+    // don't queue-everything (that lags) or cut mid-word (that swallows cues).
+    if (!critical && !isReply && voiceBusy) { voicePending = { text: p.message, onEnd }; return; }
+    speakAudio(p.message, critical || isReply, onEnd);
+  });
+
+  let active = false;       // navigating (guidance on)? — driven by /control acks
+  let started = false;      // app started (camera streaming)?
+  function setActive(on) {
+    if (!on) stopSpeech();   // kill queued/in-flight speech on stop
+    active = on; render();
+  }
+  function render() {
+    btn.classList.toggle("rec", recording);
+    btn.classList.toggle("active", active);
+    btn.textContent = recording ? "Recording…\n(release to send)"
+      : !started ? "Touch to start\nnavigation"
+      : (active ? "Navigation\nhold to speak"
+                : "Paused\ntap for navigation · hold to speak");
+  }
+  function clientSpeak(text, onDone) { speakAudio(text, true, onDone || null); }
+
+  // --- voice session: hold-to-talk pauses guidance until the reply is spoken --
+  let voiceActive = false, voiceTimer = null;
+  function sendControl(action) {
+    const c = getControl();
+    if (c && c.readyState === OPEN) { try { c.send(JSON.stringify({ action })); } catch (_) {} }
+  }
+  function enterVoiceMode() {
+    voiceActive = true;
+    sendControl("voice_start");
+    stopSpeech();   // silence any in-flight guidance
+  }
+  function endVoiceMode() {
+    if (voiceTimer) { clearTimeout(voiceTimer); voiceTimer = null; }
+    if (!voiceActive) return;
+    voiceActive = false;
+    sendControl("voice_end");
+    sendControl("nav_pause");
+    hint.textContent = "tap for navigation · hold to speak";
+    render();
+  }
+  function armVoiceTimeout(ms) {
+    if (voiceTimer) clearTimeout(voiceTimer);
+    voiceTimer = setTimeout(endVoiceMode, ms);
+  }
+
+  // --- camera stream ---
+  let cameraStarted = false, cameraLive = false;
+  async function startCamera() {
+    if (cameraStarted) return;
+    cameraStarted = true;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } }, audio: false });
+      video.srcObject = stream; await video.play();
+      cameraLive = true; started = true; render();
+      hint.textContent = "camera: streaming"; streamLoop();
+    } catch (err) {
+      cameraStarted = false;
+      hint.textContent = "camera blocked (" + err.name + ")";
+    }
+  }
+  function streamLoop() {
+    setInterval(() => {
+      if (!cameraLive || !video.videoWidth) return;
+      const cam = getCamera();
+      if (!cam || cam.readyState !== OPEN) return;
+      const scale = Math.min(1, MAX_W / video.videoWidth);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((b) => { if (b && cam.readyState === OPEN) cam.send(b); }, "image/jpeg", JPEG_Q);
+    }, Math.round(1000 / FPS));
+  }
+
+  // --- push-to-talk: mic -> 16kHz PCM16 (AudioWorklet) -> /audio ---
+  let audioCtx, micNode, worklet, recording = false, chunks = [];
+  async function setupAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.audioWorklet.addModule("pcm-worklet.js");
+    const mic = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    micNode = audioCtx.createMediaStreamSource(mic);
+    worklet = new AudioWorkletNode(audioCtx, "pcm16-downsampler");
+    worklet.port.onmessage = (e) => { if (recording) chunks.push(new Int16Array(e.data)); };
+    micNode.connect(worklet);
+    worklet.connect(audioCtx.destination);   // graph must reach destination to pull
+  }
+  async function startRecording() {
+    try { await setupAudio(); } catch (err) { hint.textContent = "mic blocked (" + err.name + ")"; return; }
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    chunks = []; recording = true; render();
+    if (navigator.vibrate) navigator.vibrate(30);
+    hint.textContent = "recording… (release to send)";
+  }
+  function stopRecording() {
+    if (!recording) return false;
+    recording = false; render();
+    let len = 0; chunks.forEach((c) => len += c.length);
+    const pcm = new Int16Array(len); let off = 0;
+    chunks.forEach((c) => { pcm.set(c, off); off += c.length; });
+    const a = getAudio();
+    if (a && a.readyState === OPEN && pcm.length) {
+      a.send(pcm.buffer); hint.textContent = "command sent"; return true;
+    }
+    hint.textContent = "nothing captured"; return false;
+  }
+
+  // --- single fullscreen target: tap = toggle nav, hold = talk ---
+  const SILENT_WAV = "data:audio/wav;base64,UklGRiwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQgAAACAgICAgICAgA==";
+  let ttsUnlocked = false;
+  let holdTimer = null, held = false;
+  btn.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault(); held = false; startCamera();
+    // Bless the audio elements inside this user gesture so later programmatic
+    // play() (from /status callbacks) is allowed by the WebView autoplay policy.
+    if (!ttsUnlocked) {
+      try { beep.play().then(() => { beep.pause(); beep.currentTime = 0; }).catch(() => {}); } catch (_) {}
+      try { voice.src = SILENT_WAV; voice.play().then(() => { voice.pause(); voice.currentTime = 0; }).catch(() => {}); } catch (_) {}
+      ttsUnlocked = true;
+    }
+    if (cameraLive) holdTimer = setTimeout(() => {
+      held = true;
+      enterVoiceMode();
+      clientSpeak("Recording started");
+      startRecording();
+    }, 1000);
+  });
+  function endPress() {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    if (held) {
+      held = false;
+      const sent = stopRecording();
+      if (sent) { clientSpeak("Processing"); hint.textContent = "processing…"; armVoiceTimeout(10000); }
+      else endVoiceMode();
+      return;
+    }
+    if (navigator.vibrate) navigator.vibrate(20);
+    sendControl(active ? "nav_off" : "nav_on");
+  }
+  btn.addEventListener("pointerup", endPress);
+  btn.addEventListener("pointercancel", () => { if (held) endPress(); });
+
+  render();
+})();
+</script>
+</body>
+</html>
